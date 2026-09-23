@@ -23,8 +23,14 @@
 #include "EventValue.g.h"
 #include "LevelControlCluster.g.h"
 #include "MatterController.g.h"
+#include "MatterControllerCommissioning.g.h"
 #include "MatterControllerRecovery.g.h"
 #include "MatterControllerNetworkCommissioning.g.h"
+#include "MatterCommissioningProgress.g.h"
+#include "MatterCommissioningResult.g.h"
+#include "MatterNetworkInterface.g.h"
+#include "MatterNetworkInterfaceProvider.g.h"
+#include "MatterNetworkInterfaceSelection.g.h"
 #include "OnNetworkCommissioningParameters.g.h"
 #include "OnOffCluster.g.h"
 #include "TimedInteractionOptions.g.h"
@@ -203,6 +209,106 @@ struct CommissioningProgressEventArgs : CommissioningProgressEventArgsT<Commissi
 private:
     Controller::CommissioningStage mStage;
     hstring mMessage;
+};
+
+struct MatterNetworkInterfaceSelection : MatterNetworkInterfaceSelectionT<MatterNetworkInterfaceSelection>
+{
+    MatterNetworkInterfaceSelection(Controller::MatterNetworkInterfaceSelectionMode mode, uint64_t interfaceId);
+    Controller::MatterNetworkInterfaceSelectionMode Mode() const;
+    uint64_t InterfaceId() const;
+
+private:
+    Controller::MatterNetworkInterfaceSelectionMode mMode;
+    uint64_t mInterfaceId;
+};
+
+struct MatterNetworkInterface : MatterNetworkInterfaceT<MatterNetworkInterface>
+{
+    MatterNetworkInterface(uint64_t id, uint32_t index, hstring name, Controller::MatterNetworkInterfaceType type,
+                           bool connected, bool supportsIpv6, bool supportsMulticast, bool isVirtual);
+    uint64_t Id() const;
+    uint32_t InterfaceIndex() const;
+    hstring Name() const;
+    Controller::MatterNetworkInterfaceType Type() const;
+    bool IsConnected() const;
+    bool SupportsIpv6() const;
+    bool SupportsMulticast() const;
+    bool IsVirtual() const;
+
+private:
+    uint64_t mId;
+    uint32_t mIndex;
+    hstring mName;
+    Controller::MatterNetworkInterfaceType mType;
+    bool mConnected;
+    bool mSupportsIpv6;
+    bool mSupportsMulticast;
+    bool mIsVirtual;
+};
+
+struct MatterCommissioningProgress : MatterCommissioningProgressT<MatterCommissioningProgress>
+{
+    MatterCommissioningProgress(Controller::MatterCommissioningStage stage,
+                                Controller::MatterCommissioningStage lastCompletedStage, int32_t nativeStageId,
+                                Controller::MatterCommissioningTransport transport, Windows::Foundation::TimeSpan elapsedTime,
+                                hstring diagnosticMessage, hstring displayMessage, uint64_t networkInterfaceId,
+                                hstring networkInterfaceName, uint32_t attemptNumber, bool isRetrying);
+    Controller::MatterCommissioningStage Stage() const;
+    Controller::MatterCommissioningStage LastCompletedStage() const;
+    int32_t NativeStageId() const;
+    Controller::MatterCommissioningTransport Transport() const;
+    Windows::Foundation::TimeSpan ElapsedTime() const;
+    hstring DiagnosticMessage() const;
+    hstring DisplayMessage() const;
+    uint64_t NetworkInterfaceId() const;
+    hstring NetworkInterfaceName() const;
+    uint32_t AttemptNumber() const;
+    bool IsRetrying() const;
+
+private:
+    Controller::MatterCommissioningStage mStage;
+    Controller::MatterCommissioningStage mLastCompletedStage;
+    int32_t mNativeStageId;
+    Controller::MatterCommissioningTransport mTransport;
+    Windows::Foundation::TimeSpan mElapsedTime;
+    hstring mDiagnosticMessage;
+    hstring mDisplayMessage;
+    uint64_t mNetworkInterfaceId;
+    hstring mNetworkInterfaceName;
+    uint32_t mAttemptNumber;
+    bool mIsRetrying;
+};
+
+struct MatterCommissioningResult : MatterCommissioningResultT<MatterCommissioningResult>
+{
+    MatterCommissioningResult(bool succeeded, Controller::MatterCommissioningOutcome outcome,
+                              Controller::MatterCommissioningFailureKind failureKind,
+                              Controller::MatterCommissioningStage failedStage,
+                              Controller::MatterCommissioningStage lastCompletedStage, int32_t nativeStageId,
+                              int32_t nativeErrorCode, hstring diagnosticMessage, uint64_t networkInterfaceId,
+                              Controller::CommissionedNode node);
+    bool Succeeded() const;
+    Controller::MatterCommissioningOutcome Outcome() const;
+    Controller::MatterCommissioningFailureKind FailureKind() const;
+    Controller::MatterCommissioningStage FailedStage() const;
+    Controller::MatterCommissioningStage LastCompletedStage() const;
+    int32_t NativeStageId() const;
+    int32_t NativeErrorCode() const;
+    hstring DiagnosticMessage() const;
+    uint64_t NetworkInterfaceId() const;
+    Controller::CommissionedNode Node() const;
+
+private:
+    bool mSucceeded;
+    Controller::MatterCommissioningOutcome mOutcome;
+    Controller::MatterCommissioningFailureKind mFailureKind;
+    Controller::MatterCommissioningStage mFailedStage;
+    Controller::MatterCommissioningStage mLastCompletedStage;
+    int32_t mNativeStageId;
+    int32_t mNativeErrorCode;
+    hstring mDiagnosticMessage;
+    uint64_t mNetworkInterfaceId;
+    Controller::CommissionedNode mNode{ nullptr };
 };
 
 struct AttributeValue : AttributeValueT<AttributeValue>
@@ -439,6 +545,38 @@ private:
     std::shared_ptr<ControllerRuntime> mRuntime;
 };
 
+struct MatterNetworkInterfaceProvider
+{
+    static Windows::Foundation::IAsyncOperation<Windows::Foundation::Collections::IVectorView<Controller::MatterNetworkInterface>>
+    GetEligibleNetworkInterfacesAsync();
+};
+
+struct MatterControllerCommissioning : MatterControllerCommissioningT<MatterControllerCommissioning>
+{
+    explicit MatterControllerCommissioning(Controller::MatterController controller);
+    event_token ProgressChanged(
+        Windows::Foundation::TypedEventHandler<Controller::MatterControllerCommissioning,
+                                               Controller::MatterCommissioningProgress> const & handler);
+    void ProgressChanged(event_token const & token) noexcept;
+    Windows::Foundation::IAsyncOperation<Controller::MatterCommissioningResult>
+    CommissionBleAsync(Controller::BleNetworkCommissioningParameters parameters,
+                       Controller::MatterNetworkInterfaceSelection interfaceSelection);
+
+private:
+    void Publish(Controller::MatterCommissioningProgress const & progress);
+    void DrainProgress();
+    void WaitForProgressDrain();
+
+    std::shared_ptr<ControllerRuntime> mRuntime;
+    winrt::event<Windows::Foundation::TypedEventHandler<Controller::MatterControllerCommissioning,
+                                                        Controller::MatterCommissioningProgress>>
+        mProgressChanged;
+    std::mutex mProgressMutex;
+    std::condition_variable mProgressCondition;
+    std::vector<Controller::MatterCommissioningProgress> mPendingProgress;
+    bool mProgressDrainScheduled = false;
+};
+
 } // namespace winrt::Matter::Windows::Controller::implementation
 
 namespace winrt::Matter::Windows::Controller::factory_implementation {
@@ -475,6 +613,15 @@ struct MatterControllerRecovery : MatterControllerRecoveryT<MatterControllerReco
 struct MatterControllerNetworkCommissioning :
     MatterControllerNetworkCommissioningT<MatterControllerNetworkCommissioning,
                                           implementation::MatterControllerNetworkCommissioning>
+{};
+struct MatterNetworkInterfaceSelection :
+    MatterNetworkInterfaceSelectionT<MatterNetworkInterfaceSelection, implementation::MatterNetworkInterfaceSelection>
+{};
+struct MatterNetworkInterfaceProvider :
+    MatterNetworkInterfaceProviderT<MatterNetworkInterfaceProvider, implementation::MatterNetworkInterfaceProvider>
+{};
+struct MatterControllerCommissioning :
+    MatterControllerCommissioningT<MatterControllerCommissioning, implementation::MatterControllerCommissioning>
 {};
 
 } // namespace winrt::Matter::Windows::Controller::factory_implementation

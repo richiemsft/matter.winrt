@@ -139,6 +139,102 @@
       <summary>Gets a human-readable description of the current stage.</summary>
     </member>
 
+    <member name="T:Matter.Windows.Controller.MatterCommissioningStage">
+      <summary>Identifies an application-facing commissioning stage. Unknown native stages remain observable through NativeStageId.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterCommissioningTransport">
+      <summary>Identifies the transport associated with a commissioning progress update.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterCommissioningOutcome">
+      <summary>Identifies whether commissioning succeeded, failed, or timed out.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterCommissioningFailureKind">
+      <summary>Classifies common terminal commissioning failures without requiring diagnostic-message parsing.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceSelectionMode">
+      <summary>Controls whether operational Matter traffic uses normal routing, prefers one interface, or requires one interface.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceType">
+      <summary>Identifies the physical network technology reported for an interface.</summary>
+    </member>
+
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceSelection">
+      <summary>Captures the operational network-interface policy for one commissioning operation.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterNetworkInterfaceSelection.#ctor(Matter.Windows.Controller.MatterNetworkInterfaceSelectionMode,System.UInt64)">
+      <summary>Creates an immutable interface selection.</summary>
+      <param name="mode">The automatic, preferred, or required selection policy.</param>
+      <param name="interfaceId">The identifier returned by MatterNetworkInterfaceProvider, or zero for automatic mode.</param>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterfaceSelection.Mode"><summary>Gets the captured selection policy.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterfaceSelection.InterfaceId"><summary>Gets the selected adapter identifier, or zero for automatic mode.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterface">
+      <summary>Describes a Windows network interface eligible for Matter operational discovery.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.Id"><summary>Gets the adapter identifier used by MatterNetworkInterfaceSelection. Re-enumerate before later operations because identifiers are valid only while adapters exist.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.InterfaceIndex"><summary>Gets the Windows interface index.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.Name"><summary>Gets the adapter name.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.Type"><summary>Gets the reported network technology.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.IsConnected"><summary>Gets whether the interface is currently up.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.SupportsIpv6"><summary>Gets whether the interface currently has an IPv6 address.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.SupportsMulticast"><summary>Gets whether the interface supports multicast.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.IsVirtual"><summary>Gets whether the adapter name identifies a common virtual or VPN interface.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterCommissioningProgress">
+      <summary>Provides an immutable snapshot of commissioning progress. It never contains setup codes or network credentials.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.Stage"><summary>Gets the current application-facing stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.LastCompletedStage"><summary>Gets the last successfully completed application-facing stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.NativeStageId"><summary>Gets the native Matter SDK stage identifier, or -1 when no native stage applies.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.Transport"><summary>Gets the transport associated with the current stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.ElapsedTime"><summary>Gets the elapsed time since this commissioning operation started.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.DiagnosticMessage"><summary>Gets stable, nonlocalized diagnostic text that does not contain credentials or setup codes.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.DisplayMessage"><summary>Gets text suitable for display by preview applications. Applications should localize their own text based on Stage for production UI.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.NetworkInterfaceId"><summary>Gets the selected operational interface identifier, or zero for automatic selection.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.NetworkInterfaceName"><summary>Gets the selected operational interface name, or an empty string when automatic selection has not chosen one.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.AttemptNumber"><summary>Gets the one-based attempt number for the current operation.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.IsRetrying"><summary>Gets whether the update reports a recoverable retry rather than terminal failure.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterCommissioningResult">
+      <summary>Contains the structured terminal result of commissioning. Cancellation instead completes the WinRT asynchronous operation in the canceled state.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.Succeeded"><summary>Gets whether commissioning completed successfully.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.Outcome"><summary>Gets the terminal success, failure, or timeout outcome.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.FailureKind"><summary>Gets the classified failure kind, or Unknown when no reliable classification is available.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.FailedStage"><summary>Gets the application-facing stage active when the operation failed.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.LastCompletedStage"><summary>Gets the last successfully completed application-facing stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.NativeStageId"><summary>Gets the native Matter SDK stage identifier, or -1 when unavailable.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.NativeErrorCode"><summary>Gets the native CHIP error integer, or zero when unavailable.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.DiagnosticMessage"><summary>Gets terminal diagnostic text without setup codes or network credentials.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.NetworkInterfaceId"><summary>Gets the requested operational interface identifier, or zero for automatic selection.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.Node"><summary>Gets the commissioned node after success, or null after failure or timeout.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceProvider">
+      <summary>Enumerates network interfaces that may participate in Matter operational discovery.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterNetworkInterfaceProvider.GetEligibleNetworkInterfacesAsync">
+      <summary>Enumerates current non-loopback interfaces. Virtual and VPN interfaces remain visible and are identified by IsVirtual.</summary>
+      <returns>A snapshot of currently eligible interfaces.</returns>
+    </member>
+
+    <member name="T:Matter.Windows.Controller.MatterControllerCommissioning">
+      <summary>Adds structured BLE network commissioning, progress, cancellation, and per-operation interface selection without changing the MatterController ABI.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterControllerCommissioning.#ctor(Matter.Windows.Controller.MatterController)">
+      <summary>Creates commissioning operations for a controller.</summary>
+      <param name="controller">The controller that will own commissioned nodes.</param>
+    </member>
+    <member name="E:Matter.Windows.Controller.MatterControllerCommissioning.ProgressChanged">
+      <summary>Occurs in order on a worker thread when commissioning changes stage or retries. Handlers are drained before the operation reaches its terminal state and must marshal UI work to the application's dispatcher.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterControllerCommissioning.CommissionBleAsync(Matter.Windows.Controller.BleNetworkCommissioningParameters,Matter.Windows.Controller.MatterNetworkInterfaceSelection)">
+      <summary>Commissions a factory-reset Wi-Fi or Thread device over BLE. Interface selection is captured at start and applies to operational DNS-SD, address resolution, CASE, and commissioning-complete traffic, not BLE. Canceling the returned operation stops native pairing and completes in the canceled state.</summary>
+      <param name="parameters">BLE setup data and exactly one Wi-Fi or Thread credential set.</param>
+      <param name="interfaceSelection">The operational-interface policy, or null to use automatic routing.</param>
+      <returns>A structured success, failure, or timeout result.</returns>
+    </member>
+
     <member name="T:Matter.Windows.Controller.CommissionedNode">
       <summary>Identifies a node persisted by the controller.</summary>
     </member>

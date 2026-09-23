@@ -33,6 +33,22 @@ internal static class ApiSurfaceCompileChecks
 
     internal static async Task ExerciseNetworkCommissioningAsync(MatterController controller)
     {
+        IReadOnlyList<MatterNetworkInterface> interfaces =
+            await MatterNetworkInterfaceProvider.GetEligibleNetworkInterfacesAsync();
+        MatterNetworkInterfaceSelection automatic = new(
+            MatterNetworkInterfaceSelectionMode.Automatic,
+            0);
+        var commissioning = new MatterControllerCommissioning(controller);
+        commissioning.ProgressChanged += (_, progress) =>
+        {
+            MatterCommissioningStage stage = progress.Stage;
+            MatterCommissioningTransport transport = progress.Transport;
+            _ = (stage, transport, progress.LastCompletedStage, progress.NativeStageId,
+                progress.ElapsedTime, progress.DiagnosticMessage, progress.DisplayMessage,
+                progress.NetworkInterfaceId, progress.NetworkInterfaceName,
+                progress.AttemptNumber, progress.IsRetrying);
+        };
+
         var wiFi = new BleNetworkCommissioningParameters
         {
             NodeId = 1,
@@ -40,7 +56,10 @@ internal static class ApiSurfaceCompileChecks
             LongDiscriminator = 3840,
             WiFi = new WiFiNetworkCredentials("network", "passphrase")
         };
-        await new MatterControllerNetworkCommissioning(controller).CommissionBleAsync(wiFi);
+        MatterCommissioningResult result = await commissioning.CommissionBleAsync(wiFi, automatic);
+        _ = (result.Succeeded, result.Outcome, result.FailureKind, result.FailedStage,
+            result.LastCompletedStage, result.NativeStageId, result.NativeErrorCode,
+            result.DiagnosticMessage, result.NetworkInterfaceId, result.Node);
 
         var dataset = new Windows.Storage.Streams.Buffer(16) { Length = 16 };
         var thread = new BleNetworkCommissioningParameters
@@ -50,6 +69,13 @@ internal static class ApiSurfaceCompileChecks
             LongDiscriminator = 3840,
             Thread = new ThreadNetworkCredentials(dataset)
         };
-        await new MatterControllerNetworkCommissioning(controller).CommissionBleAsync(thread);
+        await commissioning.CommissionBleAsync(thread, automatic);
+
+        foreach (MatterNetworkInterface networkInterface in interfaces)
+        {
+            _ = (networkInterface.Id, networkInterface.InterfaceIndex, networkInterface.Name,
+                networkInterface.Type, networkInterface.IsConnected, networkInterface.SupportsIpv6,
+                networkInterface.SupportsMulticast, networkInterface.IsVirtual);
+        }
     }
 }

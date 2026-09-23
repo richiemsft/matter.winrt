@@ -14,6 +14,70 @@ namespace Matter.Windows.Controller
         Complete = 6
     };
 
+    enum MatterCommissioningStage
+    {
+        Unknown = 0,
+        SearchingForDevice = 1,
+        ConnectingOverBluetooth = 2,
+        EstablishingPase = 3,
+        ReadingCommissioningInformation = 4,
+        ConfiguringRegulatoryInformation = 5,
+        ProvisioningNetwork = 6,
+        ConnectingDeviceToNetwork = 7,
+        DiscoveringOperationalDevice = 8,
+        EstablishingCase = 9,
+        SendingCommissioningComplete = 10,
+        Completed = 11,
+        Failed = 12
+    };
+
+    enum MatterCommissioningTransport
+    {
+        Unknown = 0,
+        Bluetooth = 1,
+        WiFi = 2,
+        Thread = 3,
+        Ethernet = 4,
+        OperationalIp = 5
+    };
+
+    enum MatterCommissioningOutcome
+    {
+        Succeeded = 0,
+        Failed = 1,
+        TimedOut = 2
+    };
+
+    enum MatterCommissioningFailureKind
+    {
+        Unknown = 0,
+        DeviceNotFoundOverBluetooth = 1,
+        BluetoothConnectionFailed = 2,
+        PaseFailed = 3,
+        NetworkCredentialsRejected = 4,
+        DeviceNetworkConnectionFailed = 5,
+        OperationalDiscoveryTimedOut = 6,
+        CaseEstablishmentFailed = 7,
+        CommissioningCompleteFailed = 8,
+        OverallTimeout = 9
+    };
+
+    enum MatterNetworkInterfaceSelectionMode
+    {
+        Automatic = 0,
+        PreferSpecifiedInterface = 1,
+        RequireSpecifiedInterface = 2
+    };
+
+    enum MatterNetworkInterfaceType
+    {
+        Unknown = 0,
+        WiFi = 1,
+        Ethernet = 2,
+        Cellular = 3,
+        Thread = 4
+    };
+
     runtimeclass ControllerOptions
     {
         ControllerOptions();
@@ -68,6 +132,54 @@ namespace Matter.Windows.Controller
     {
         CommissioningStage Stage { get; };
         String Message { get; };
+    };
+
+    runtimeclass MatterNetworkInterfaceSelection
+    {
+        MatterNetworkInterfaceSelection(MatterNetworkInterfaceSelectionMode mode, UInt64 interfaceId);
+        MatterNetworkInterfaceSelectionMode Mode { get; };
+        UInt64 InterfaceId { get; };
+    };
+
+    runtimeclass MatterNetworkInterface
+    {
+        UInt64 Id { get; };
+        UInt32 InterfaceIndex { get; };
+        String Name { get; };
+        MatterNetworkInterfaceType Type { get; };
+        Boolean IsConnected { get; };
+        Boolean SupportsIpv6 { get; };
+        Boolean SupportsMulticast { get; };
+        Boolean IsVirtual { get; };
+    };
+
+    runtimeclass MatterCommissioningProgress
+    {
+        MatterCommissioningStage Stage { get; };
+        MatterCommissioningStage LastCompletedStage { get; };
+        Int32 NativeStageId { get; };
+        MatterCommissioningTransport Transport { get; };
+        Windows.Foundation.TimeSpan ElapsedTime { get; };
+        String DiagnosticMessage { get; };
+        String DisplayMessage { get; };
+        UInt64 NetworkInterfaceId { get; };
+        String NetworkInterfaceName { get; };
+        UInt32 AttemptNumber { get; };
+        Boolean IsRetrying { get; };
+    };
+
+    runtimeclass MatterCommissioningResult
+    {
+        Boolean Succeeded { get; };
+        MatterCommissioningOutcome Outcome { get; };
+        MatterCommissioningFailureKind FailureKind { get; };
+        MatterCommissioningStage FailedStage { get; };
+        MatterCommissioningStage LastCompletedStage { get; };
+        Int32 NativeStageId { get; };
+        Int32 NativeErrorCode { get; };
+        String DiagnosticMessage { get; };
+        UInt64 NetworkInterfaceId { get; };
+        CommissionedNode Node { get; };
     };
 
     runtimeclass CommissionedNode
@@ -214,5 +326,20 @@ namespace Matter.Windows.Controller
     {
         MatterControllerNetworkCommissioning(MatterController controller);
         Windows.Foundation.IAsyncOperation<CommissionedNode> CommissionBleAsync(BleNetworkCommissioningParameters parameters);
+    };
+
+    runtimeclass MatterNetworkInterfaceProvider
+    {
+        static Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<MatterNetworkInterface> >
+            GetEligibleNetworkInterfacesAsync();
+    };
+
+    runtimeclass MatterControllerCommissioning
+    {
+        MatterControllerCommissioning(MatterController controller);
+        event Windows.Foundation.TypedEventHandler<MatterControllerCommissioning, MatterCommissioningProgress> ProgressChanged;
+        Windows.Foundation.IAsyncOperation<MatterCommissioningResult> CommissionBleAsync(
+            BleNetworkCommissioningParameters parameters,
+            MatterNetworkInterfaceSelection interfaceSelection);
     };
 }

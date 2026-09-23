@@ -18,6 +18,7 @@
 #include <crypto/CHIPCryptoPAL.h>
 #include <crypto/PersistentStorageOperationalKeystore.h>
 #include <crypto/RawKeySessionKeystore.h>
+#include <inet/InetInterface.h>
 #include <lib/support/CHIPMem.h>
 #include <lib/support/TestGroupData.h>
 #include <lib/core/TLV.h>
@@ -27,10 +28,13 @@
 #include <platform/Windows/ConfigurationManagerImpl.h>
 #include <setup_payload/ManualSetupPayloadGenerator.h>
 #include <setup_payload/SetupPayload.h>
+#include <winrt/Windows.System.Threading.h>
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <array>
+#include <cctype>
 #include <condition_variable>
 #include <exception>
 #include <filesystem>
@@ -57,6 +61,92 @@ constexpr auto kTimedInteractionMargin  = std::chrono::seconds(5);
 constexpr char kCommissionedNodesKey[] = "winrt/nodes";
 constexpr size_t kGenericTlvBufferSize = 64 * 1024;
 constexpr size_t kMaximumPendingReports = 256;
+
+struct NativeCommissioningProgress
+{
+    chip::Controller::CommissioningStage stage;
+    CHIP_ERROR error = CHIP_NO_ERROR;
+    bool completed   = false;
+    bool retrying    = false;
+};
+
+using CommissioningProgressCallback = std::function<void(const NativeCommissioningProgress &)>;
+
+Controller::MatterCommissioningStage ProjectCommissioningStage(chip::Controller::CommissioningStage stage)
+{
+    switch (stage)
+    {
+    case chip::Controller::CommissioningStage::kSecurePairing:
+        return Controller::MatterCommissioningStage::EstablishingPase;
+    case chip::Controller::CommissioningStage::kReadCommissioningInfo:
+        return Controller::MatterCommissioningStage::ReadingCommissioningInformation;
+    case chip::Controller::CommissioningStage::kConfigRegulatory:
+        return Controller::MatterCommissioningStage::ConfiguringRegulatoryInformation;
+    case chip::Controller::CommissioningStage::kWiFiNetworkSetup:
+    case chip::Controller::CommissioningStage::kThreadNetworkSetup:
+    case chip::Controller::CommissioningStage::kRequestWiFiCredentials:
+    case chip::Controller::CommissioningStage::kRequestThreadCredentials:
+        return Controller::MatterCommissioningStage::ProvisioningNetwork;
+    case chip::Controller::CommissioningStage::kWiFiNetworkEnable:
+    case chip::Controller::CommissioningStage::kThreadNetworkEnable:
+        return Controller::MatterCommissioningStage::ConnectingDeviceToNetwork;
+    case chip::Controller::CommissioningStage::kFindOperationalForStayActive:
+    case chip::Controller::CommissioningStage::kFindOperationalForCommissioningComplete:
+        return Controller::MatterCommissioningStage::DiscoveringOperationalDevice;
+    case chip::Controller::CommissioningStage::kSendComplete:
+        return Controller::MatterCommissioningStage::SendingCommissioningComplete;
+    default:
+        return Controller::MatterCommissioningStage::Unknown;
+    }
+}
+
+Controller::MatterCommissioningTransport ProjectCommissioningTransport(chip::Controller::CommissioningStage stage)
+{
+    if (stage == chip::Controller::CommissioningStage::kFindOperationalForStayActive ||
+        stage == chip::Controller::CommissioningStage::kFindOperationalForCommissioningComplete ||
+        stage == chip::Controller::CommissioningStage::kSendComplete)
+    {
+        return Controller::MatterCommissioningTransport::OperationalIp;
+    }
+    if (stage == chip::Controller::CommissioningStage::kWiFiNetworkSetup ||
+        stage == chip::Controller::CommissioningStage::kWiFiNetworkEnable)
+    {
+        return Controller::MatterCommissioningTransport::WiFi;
+    }
+    if (stage == chip::Controller::CommissioningStage::kThreadNetworkSetup ||
+        stage == chip::Controller::CommissioningStage::kThreadNetworkEnable)
+    {
+        return Controller::MatterCommissioningTransport::Thread;
+    }
+    return Controller::MatterCommissioningTransport::Bluetooth;
+}
+
+Controller::MatterCommissioningFailureKind ClassifyCommissioningFailure(Controller::MatterCommissioningStage stage,
+                                                                        bool timedOut)
+{
+    switch (stage)
+    {
+    case Controller::MatterCommissioningStage::SearchingForDevice:
+        return Controller::MatterCommissioningFailureKind::DeviceNotFoundOverBluetooth;
+    case Controller::MatterCommissioningStage::ConnectingOverBluetooth:
+        return Controller::MatterCommissioningFailureKind::BluetoothConnectionFailed;
+    case Controller::MatterCommissioningStage::EstablishingPase:
+        return Controller::MatterCommissioningFailureKind::PaseFailed;
+    case Controller::MatterCommissioningStage::ProvisioningNetwork:
+        return Controller::MatterCommissioningFailureKind::NetworkCredentialsRejected;
+    case Controller::MatterCommissioningStage::ConnectingDeviceToNetwork:
+        return Controller::MatterCommissioningFailureKind::DeviceNetworkConnectionFailed;
+    case Controller::MatterCommissioningStage::DiscoveringOperationalDevice:
+        return Controller::MatterCommissioningFailureKind::OperationalDiscoveryTimedOut;
+    case Controller::MatterCommissioningStage::EstablishingCase:
+        return Controller::MatterCommissioningFailureKind::CaseEstablishmentFailed;
+    case Controller::MatterCommissioningStage::SendingCommissioningComplete:
+        return Controller::MatterCommissioningFailureKind::CommissioningCompleteFailed;
+    default:
+        return timedOut ? Controller::MatterCommissioningFailureKind::OverallTimeout
+                        : Controller::MatterCommissioningFailureKind::Unknown;
+    }
+}
 
 std::vector<uint8_t> Utf8Bytes(hstring const & value)
 {
@@ -348,6 +438,7 @@ struct PairingState
     Optional<chip::Controller::CommissioningStage> lastCompletedStage;
     CompletionStatus completionStatus;
     bool hasCompletionStatus = false;
+    CommissioningProgressCallback progressCallback;
 };
 
 void AppendStage(std::wstring & message, wchar_t const * label, Optional<chip::Controller::CommissioningStage> stage)
@@ -374,18 +465,6 @@ void AppendStage(std::wstring & message, wchar_t const * label, Optional<chip::C
         message.append(std::to_wstring(static_cast<uint16_t>(value)));
     }
     message.append(L".");
-}
-
-void AppendDeviceDebugText(std::wstring & message, wchar_t const * label, std::string const & text)
-{
-    if (!text.empty())
-    {
-        message.append(L" ");
-        message.append(label);
-        message.append(L": ");
-        message.append(to_hstring(text).c_str());
-        message.append(L".");
-    }
 }
 
 std::wstring CommissioningTimeoutMessage(PairingState const & state)
@@ -435,8 +514,6 @@ std::wstring CommissioningTimeoutMessage(PairingState const & state)
         message.append(std::to_wstring(static_cast<uint16_t>(state.completionStatus.attestationResult.Value())));
         message.append(L".");
     }
-    AppendDeviceDebugText(message, L"Commissioning debug text", state.completionStatus.commissioningDebugText);
-    AppendDeviceDebugText(message, L"Network commissioning debug text", state.completionStatus.networkCommissioningDebugText);
     throw hresult_error(HRESULT_FROM_WIN32(ERROR_GEN_FAILURE), message);
 }
 
@@ -445,7 +522,7 @@ class PairingDelegate final : public DevicePairingDelegate, public Credentials::
 public:
     PairingDelegate(PairingState & state, bool allowTestAttestation) : mState(state), mAllowTestAttestation(allowTestAttestation) {}
 
-    void Reset()
+    void Reset(CommissioningProgressCallback progressCallback = {})
     {
         std::scoped_lock lock(mState.mutex);
         mState.complete               = false;
@@ -454,6 +531,7 @@ public:
         mState.lastCompletedStage     = NullOptional;
         mState.completionStatus       = CompletionStatus();
         mState.hasCompletionStatus    = false;
+        mState.progressCallback       = std::move(progressCallback);
     }
 
     void OnCommissioningComplete(NodeId, CHIP_ERROR error) override
@@ -475,15 +553,44 @@ public:
 
     void OnCommissioningStageStart(PeerId, chip::Controller::CommissioningStage stageStarting) override
     {
-        std::scoped_lock lock(mState.mutex);
-        mState.activeStage = MakeOptional(stageStarting);
+        CommissioningProgressCallback callback;
+        {
+            std::scoped_lock lock(mState.mutex);
+            mState.activeStage = MakeOptional(stageStarting);
+            callback           = mState.progressCallback;
+        }
+        if (callback)
+        {
+            callback({ stageStarting, CHIP_NO_ERROR, false, false });
+        }
     }
 
-    void OnCommissioningStatusUpdate(PeerId, chip::Controller::CommissioningStage stageCompleted, CHIP_ERROR) override
+    void OnCommissioningStatusUpdate(PeerId, chip::Controller::CommissioningStage stageCompleted, CHIP_ERROR error) override
     {
-        std::scoped_lock lock(mState.mutex);
-        mState.lastCompletedStage = MakeOptional(stageCompleted);
-        mState.activeStage        = NullOptional;
+        CommissioningProgressCallback callback;
+        {
+            std::scoped_lock lock(mState.mutex);
+            mState.lastCompletedStage = MakeOptional(stageCompleted);
+            mState.activeStage        = NullOptional;
+            callback                  = mState.progressCallback;
+        }
+        if (callback)
+        {
+            callback({ stageCompleted, error, true, false });
+        }
+    }
+
+    void OnCommissioningRetry(PeerId, chip::Controller::CommissioningStage stage, CHIP_ERROR error) override
+    {
+        CommissioningProgressCallback callback;
+        {
+            std::scoped_lock lock(mState.mutex);
+            callback = mState.progressCallback;
+        }
+        if (callback)
+        {
+            callback({ stage, error, false, true });
+        }
     }
 
     Optional<uint16_t> FailSafeExpiryTimeoutSecs() const override { return NullOptional; }
@@ -1325,11 +1432,14 @@ public:
     Controller::CommissionedNode Commission(uint64_t nodeId, uint32_t pinCode, uint16_t discriminator, bool useBle,
                                             std::string const & providedSetupCode = {},
                                             std::optional<WiFiCredentials> const & wiFiCredentials = std::nullopt,
-                                            ByteSpan threadOperationalDataset = {})
+                                            ByteSpan threadOperationalDataset = {},
+                                            Optional<AddressResolve::InterfaceSelection> interfaceSelection = NullOptional,
+                                            CommissioningProgressCallback progressCallback = {},
+                                            std::shared_ptr<std::atomic_bool> cancellationRequested = {})
     {
         std::scoped_lock operationLock(mOperationMutex);
         EnsureOpen();
-        mPairingDelegate.Reset();
+        mPairingDelegate.Reset(std::move(progressCallback));
         std::string setupCode = providedSetupCode.empty() ? GenerateSetupCode(pinCode, discriminator) : providedSetupCode;
 
         CommissioningParameters parameters;
@@ -1342,11 +1452,19 @@ public:
         {
             parameters.SetThreadOperationalDataset(threadOperationalDataset);
         }
+        if (interfaceSelection.HasValue())
+        {
+            parameters.SetOperationalInterfaceSelection(interfaceSelection.Value());
+        }
         PlatformMgr().LockChipStack();
         CHIP_ERROR error = mCommissioner.PairDevice(
             nodeId, setupCode.c_str(), parameters, useBle ? DiscoveryType::kDiscoveryBleOnly : DiscoveryType::kDiscoveryNetworkOnly);
         PlatformMgr().UnlockChipStack();
         CheckChipError(error, L"Start commissioning");
+        if (cancellationRequested && cancellationRequested->load(std::memory_order_acquire))
+        {
+            CancelCommission(nodeId);
+        }
 
         std::unique_lock lock(mPairingState.mutex);
         if (!mPairingState.condition.wait_for(lock, kCommissioningTimeout, [this]() { return mPairingState.complete; }))
@@ -1374,6 +1492,13 @@ public:
             PersistCommissionedNodes();
         }
         return winrt::make<implementation::CommissionedNode>(nodeId, mCommissioner.GetFabricIndex());
+    }
+
+    void CancelCommission(uint64_t nodeId)
+    {
+        PlatformMgr().LockChipStack();
+        (void) mCommissioner.StopPairing(nodeId);
+        PlatformMgr().UnlockChipStack();
     }
 
     std::vector<uint64_t> CommissionedNodes()
@@ -2281,6 +2406,89 @@ hstring CommissioningProgressEventArgs::Message() const
     return mMessage;
 }
 
+MatterNetworkInterfaceSelection::MatterNetworkInterfaceSelection(Controller::MatterNetworkInterfaceSelectionMode mode,
+                                                                 uint64_t interfaceId) :
+    mMode(mode),
+    mInterfaceId(interfaceId)
+{
+    if ((mode == Controller::MatterNetworkInterfaceSelectionMode::Automatic) != (interfaceId == 0))
+    {
+        throw hresult_invalid_argument(L"Automatic selection requires interface ID 0; explicit selection requires a nonzero ID.");
+    }
+}
+
+Controller::MatterNetworkInterfaceSelectionMode MatterNetworkInterfaceSelection::Mode() const
+{
+    return mMode;
+}
+
+uint64_t MatterNetworkInterfaceSelection::InterfaceId() const
+{
+    return mInterfaceId;
+}
+
+MatterNetworkInterface::MatterNetworkInterface(uint64_t id, uint32_t index, hstring name,
+                                               Controller::MatterNetworkInterfaceType type, bool connected,
+                                               bool supportsIpv6, bool supportsMulticast, bool isVirtual) :
+    mId(id),
+    mIndex(index), mName(std::move(name)), mType(type), mConnected(connected), mSupportsIpv6(supportsIpv6),
+    mSupportsMulticast(supportsMulticast), mIsVirtual(isVirtual)
+{}
+
+uint64_t MatterNetworkInterface::Id() const { return mId; }
+uint32_t MatterNetworkInterface::InterfaceIndex() const { return mIndex; }
+hstring MatterNetworkInterface::Name() const { return mName; }
+Controller::MatterNetworkInterfaceType MatterNetworkInterface::Type() const { return mType; }
+bool MatterNetworkInterface::IsConnected() const { return mConnected; }
+bool MatterNetworkInterface::SupportsIpv6() const { return mSupportsIpv6; }
+bool MatterNetworkInterface::SupportsMulticast() const { return mSupportsMulticast; }
+bool MatterNetworkInterface::IsVirtual() const { return mIsVirtual; }
+
+MatterCommissioningProgress::MatterCommissioningProgress(
+    Controller::MatterCommissioningStage stage, Controller::MatterCommissioningStage lastCompletedStage, int32_t nativeStageId,
+    Controller::MatterCommissioningTransport transport, Windows::Foundation::TimeSpan elapsedTime, hstring diagnosticMessage,
+    hstring displayMessage, uint64_t networkInterfaceId, hstring networkInterfaceName, uint32_t attemptNumber, bool isRetrying) :
+    mStage(stage),
+    mLastCompletedStage(lastCompletedStage), mNativeStageId(nativeStageId), mTransport(transport), mElapsedTime(elapsedTime),
+    mDiagnosticMessage(std::move(diagnosticMessage)), mDisplayMessage(std::move(displayMessage)),
+    mNetworkInterfaceId(networkInterfaceId), mNetworkInterfaceName(std::move(networkInterfaceName)),
+    mAttemptNumber(attemptNumber), mIsRetrying(isRetrying)
+{}
+
+Controller::MatterCommissioningStage MatterCommissioningProgress::Stage() const { return mStage; }
+Controller::MatterCommissioningStage MatterCommissioningProgress::LastCompletedStage() const { return mLastCompletedStage; }
+int32_t MatterCommissioningProgress::NativeStageId() const { return mNativeStageId; }
+Controller::MatterCommissioningTransport MatterCommissioningProgress::Transport() const { return mTransport; }
+Windows::Foundation::TimeSpan MatterCommissioningProgress::ElapsedTime() const { return mElapsedTime; }
+hstring MatterCommissioningProgress::DiagnosticMessage() const { return mDiagnosticMessage; }
+hstring MatterCommissioningProgress::DisplayMessage() const { return mDisplayMessage; }
+uint64_t MatterCommissioningProgress::NetworkInterfaceId() const { return mNetworkInterfaceId; }
+hstring MatterCommissioningProgress::NetworkInterfaceName() const { return mNetworkInterfaceName; }
+uint32_t MatterCommissioningProgress::AttemptNumber() const { return mAttemptNumber; }
+bool MatterCommissioningProgress::IsRetrying() const { return mIsRetrying; }
+
+MatterCommissioningResult::MatterCommissioningResult(
+    bool succeeded, Controller::MatterCommissioningOutcome outcome, Controller::MatterCommissioningFailureKind failureKind,
+    Controller::MatterCommissioningStage failedStage, Controller::MatterCommissioningStage lastCompletedStage,
+    int32_t nativeStageId, int32_t nativeErrorCode, hstring diagnosticMessage, uint64_t networkInterfaceId,
+    Controller::CommissionedNode node) :
+    mSucceeded(succeeded),
+    mOutcome(outcome), mFailureKind(failureKind), mFailedStage(failedStage), mLastCompletedStage(lastCompletedStage),
+    mNativeStageId(nativeStageId), mNativeErrorCode(nativeErrorCode), mDiagnosticMessage(std::move(diagnosticMessage)),
+    mNetworkInterfaceId(networkInterfaceId), mNode(std::move(node))
+{}
+
+bool MatterCommissioningResult::Succeeded() const { return mSucceeded; }
+Controller::MatterCommissioningOutcome MatterCommissioningResult::Outcome() const { return mOutcome; }
+Controller::MatterCommissioningFailureKind MatterCommissioningResult::FailureKind() const { return mFailureKind; }
+Controller::MatterCommissioningStage MatterCommissioningResult::FailedStage() const { return mFailedStage; }
+Controller::MatterCommissioningStage MatterCommissioningResult::LastCompletedStage() const { return mLastCompletedStage; }
+int32_t MatterCommissioningResult::NativeStageId() const { return mNativeStageId; }
+int32_t MatterCommissioningResult::NativeErrorCode() const { return mNativeErrorCode; }
+hstring MatterCommissioningResult::DiagnosticMessage() const { return mDiagnosticMessage; }
+uint64_t MatterCommissioningResult::NetworkInterfaceId() const { return mNetworkInterfaceId; }
+Controller::CommissionedNode MatterCommissioningResult::Node() const { return mNode; }
+
 AttributeValue::AttributeValue(Controller::AttributePath path, Windows::Foundation::Collections::IPropertySet data) :
     mPath(std::move(path)), mData(std::move(data))
 {}
@@ -2979,6 +3187,408 @@ MatterControllerNetworkCommissioning::CommissionBleAsync(Controller::BleNetworkC
     uint16_t discriminator = parameters.LongDiscriminator();
     co_await resume_background();
     co_return mRuntime->Commission(nodeId, setupPinCode, discriminator, true, {}, nativeWiFi, threadDataset);
+}
+
+Windows::Foundation::IAsyncOperation<Windows::Foundation::Collections::IVectorView<Controller::MatterNetworkInterface>>
+MatterNetworkInterfaceProvider::GetEligibleNetworkInterfacesAsync()
+{
+    co_await resume_background();
+    std::vector<Controller::MatterNetworkInterface> interfaces;
+    for (Inet::InterfaceIterator iterator; iterator.HasCurrent(); iterator.Next())
+    {
+        Inet::InterfaceId id = iterator.GetInterfaceId();
+        if (!id.IsPresent() || iterator.IsLoopback())
+        {
+            continue;
+        }
+
+        char nameBuffer[Inet::InterfaceId::kMaxIfNameLength] = {};
+        if (iterator.GetInterfaceName(nameBuffer, sizeof(nameBuffer)) != CHIP_NO_ERROR)
+        {
+            continue;
+        }
+
+        Inet::InterfaceType nativeType = Inet::InterfaceType::Unknown;
+        (void) iterator.GetInterfaceType(nativeType);
+        bool supportsIpv6 = false;
+        for (Inet::InterfaceAddressIterator addressIterator; addressIterator.HasCurrent(); addressIterator.Next())
+        {
+            Inet::IPAddress address;
+            if (addressIterator.GetInterfaceId() == id && addressIterator.GetAddress(address) == CHIP_NO_ERROR && address.IsIPv6())
+            {
+                supportsIpv6 = true;
+                break;
+            }
+        }
+
+        std::string name = nameBuffer;
+        std::string lowerName(name);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        bool isVirtual = lowerName.find("virtual") != std::string::npos || lowerName.find("vethernet") != std::string::npos ||
+            lowerName.find("hyper-v") != std::string::npos || lowerName.find("vpn") != std::string::npos;
+        interfaces.push_back(winrt::make<implementation::MatterNetworkInterface>(
+            id.GetPlatformInterface(), id.GetInterfaceIndex(), to_hstring(name),
+            static_cast<Controller::MatterNetworkInterfaceType>(nativeType), iterator.IsUp(), supportsIpv6,
+            iterator.SupportsMulticast(), isVirtual));
+    }
+    co_return single_threaded_vector(std::move(interfaces)).GetView();
+}
+
+MatterControllerCommissioning::MatterControllerCommissioning(Controller::MatterController controller)
+{
+    if (!controller)
+    {
+        throw hresult_invalid_argument(L"controller cannot be null.");
+    }
+    mRuntime = get_self<implementation::MatterController>(controller)->Runtime();
+}
+
+event_token MatterControllerCommissioning::ProgressChanged(
+    Windows::Foundation::TypedEventHandler<Controller::MatterControllerCommissioning,
+                                           Controller::MatterCommissioningProgress> const & handler)
+{
+    return mProgressChanged.add(handler);
+}
+
+void MatterControllerCommissioning::ProgressChanged(event_token const & token) noexcept
+{
+    mProgressChanged.remove(token);
+}
+
+void MatterControllerCommissioning::Publish(Controller::MatterCommissioningProgress const & progress)
+{
+    bool scheduleDrain = false;
+    {
+        std::scoped_lock lock(mProgressMutex);
+        mPendingProgress.push_back(progress);
+        if (!mProgressDrainScheduled)
+        {
+            mProgressDrainScheduled = true;
+            scheduleDrain            = true;
+        }
+    }
+    if (scheduleDrain)
+    {
+        auto strong = get_strong();
+        Windows::System::Threading::ThreadPool::RunAsync(
+            [strong = std::move(strong)](Windows::Foundation::IAsyncAction const &) { strong->DrainProgress(); });
+    }
+}
+
+void MatterControllerCommissioning::DrainProgress()
+{
+    while (true)
+    {
+        Controller::MatterCommissioningProgress progress{ nullptr };
+        {
+            std::scoped_lock lock(mProgressMutex);
+            if (mPendingProgress.empty())
+            {
+                mProgressDrainScheduled = false;
+                mProgressCondition.notify_all();
+                return;
+            }
+            progress = mPendingProgress.front();
+            mPendingProgress.erase(mPendingProgress.begin());
+        }
+        try
+        {
+            mProgressChanged(*this, progress);
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+void MatterControllerCommissioning::WaitForProgressDrain()
+{
+    std::unique_lock lock(mProgressMutex);
+    mProgressCondition.wait(lock, [this]() { return !mProgressDrainScheduled && mPendingProgress.empty(); });
+}
+
+Windows::Foundation::IAsyncOperation<Controller::MatterCommissioningResult>
+MatterControllerCommissioning::CommissionBleAsync(Controller::BleNetworkCommissioningParameters parameters,
+                                                   Controller::MatterNetworkInterfaceSelection interfaceSelection)
+{
+    auto lifetime = get_strong();
+    if (!parameters)
+    {
+        throw hresult_invalid_argument(L"parameters cannot be null.");
+    }
+    if (!interfaceSelection)
+    {
+        interfaceSelection = winrt::make<implementation::MatterNetworkInterfaceSelection>(
+            Controller::MatterNetworkInterfaceSelectionMode::Automatic, 0);
+    }
+
+    auto wiFi   = parameters.WiFi();
+    auto thread = parameters.Thread();
+    if (static_cast<bool>(wiFi) == static_cast<bool>(thread))
+    {
+        throw hresult_invalid_argument(L"Provide exactly one Wi-Fi or Thread credential set.");
+    }
+
+    std::optional<WiFiCredentials> nativeWiFi;
+    ByteSpan threadDataset;
+    if (wiFi)
+    {
+        auto implementation     = get_self<implementation::WiFiNetworkCredentials>(wiFi);
+        auto const & ssid       = implementation->Ssid();
+        auto const & passphrase = implementation->Passphrase();
+        nativeWiFi.emplace(ByteSpan(ssid.data(), ssid.size()), ByteSpan(passphrase.data(), passphrase.size()));
+    }
+    else
+    {
+        auto const & dataset = get_self<implementation::ThreadNetworkCredentials>(thread)->OperationalDataset();
+        threadDataset        = ByteSpan(dataset.data(), dataset.size());
+    }
+
+    AddressResolve::InterfaceSelection nativeSelection;
+    nativeSelection.interfaceId = Inet::InterfaceId(interfaceSelection.InterfaceId());
+    switch (interfaceSelection.Mode())
+    {
+    case Controller::MatterNetworkInterfaceSelectionMode::Automatic:
+        nativeSelection.mode = AddressResolve::InterfaceSelectionMode::kAutomatic;
+        break;
+    case Controller::MatterNetworkInterfaceSelectionMode::PreferSpecifiedInterface:
+        nativeSelection.mode = AddressResolve::InterfaceSelectionMode::kPrefer;
+        break;
+    case Controller::MatterNetworkInterfaceSelectionMode::RequireSpecifiedInterface:
+        nativeSelection.mode = AddressResolve::InterfaceSelectionMode::kRequire;
+        break;
+    default:
+        throw hresult_invalid_argument(L"Unknown network interface selection mode.");
+    }
+
+    hstring interfaceName;
+    if (nativeSelection.mode != AddressResolve::InterfaceSelectionMode::kAutomatic)
+    {
+        bool found             = false;
+        bool connected         = false;
+        bool supportsMulticast = false;
+        bool supportsIpv6      = false;
+        for (Inet::InterfaceIterator iterator; iterator.HasCurrent(); iterator.Next())
+        {
+            if (iterator.GetInterfaceId() != nativeSelection.interfaceId)
+            {
+                continue;
+            }
+            found             = true;
+            connected         = iterator.IsUp();
+            supportsMulticast = iterator.SupportsMulticast();
+            char nameBuffer[Inet::InterfaceId::kMaxIfNameLength] = {};
+            if (iterator.GetInterfaceName(nameBuffer, sizeof(nameBuffer)) == CHIP_NO_ERROR)
+            {
+                interfaceName = to_hstring(nameBuffer);
+            }
+            break;
+        }
+        if (found)
+        {
+            for (Inet::InterfaceAddressIterator iterator; iterator.HasCurrent(); iterator.Next())
+            {
+                Inet::IPAddress address;
+                if (iterator.GetInterfaceId() == nativeSelection.interfaceId &&
+                    iterator.GetAddress(address) == CHIP_NO_ERROR && address.IsIPv6())
+                {
+                    supportsIpv6 = true;
+                    break;
+                }
+            }
+        }
+        if (nativeSelection.mode == AddressResolve::InterfaceSelectionMode::kRequire)
+        {
+            if (!found)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceNotFound");
+            }
+            if (!connected)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceDisconnected");
+            }
+            if (!supportsIpv6)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceDoesNotSupportIpv6");
+            }
+            if (!supportsMulticast)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceDoesNotSupportMulticast");
+            }
+        }
+    }
+
+    struct ProgressState
+    {
+        std::mutex mutex;
+        Controller::MatterCommissioningStage lastCompleted = Controller::MatterCommissioningStage::Unknown;
+        Controller::MatterCommissioningStage active        = Controller::MatterCommissioningStage::SearchingForDevice;
+        int32_t nativeStageId                               = -1;
+        int32_t nativeError                                 = 0;
+        uint32_t attemptNumber                              = 1;
+        uint64_t networkInterfaceId                         = 0;
+        hstring networkInterfaceName;
+    };
+
+    auto state = std::make_shared<ProgressState>();
+    auto start = std::chrono::steady_clock::now();
+    uint64_t interfaceId = interfaceSelection.InterfaceId();
+    state->networkInterfaceId   = interfaceId;
+    state->networkInterfaceName = interfaceName;
+    auto selectionMode          = interfaceSelection.Mode();
+    auto weak            = get_weak();
+    Publish(winrt::make<implementation::MatterCommissioningProgress>(
+        Controller::MatterCommissioningStage::SearchingForDevice, Controller::MatterCommissioningStage::Unknown, -1,
+        Controller::MatterCommissioningTransport::Bluetooth, Windows::Foundation::TimeSpan::zero(),
+        L"Searching for the Matter device over Bluetooth.", L"Searching for device", interfaceId, interfaceName, 1, false));
+
+    CommissioningProgressCallback callback = [weak, state, start, selectionMode](const NativeCommissioningProgress & update) {
+        auto self = weak.get();
+        if (!self)
+        {
+            return;
+        }
+        Controller::MatterCommissioningStage stage = ProjectCommissioningStage(update.stage);
+        Controller::MatterCommissioningStage lastCompleted;
+        uint32_t attemptNumber;
+        uint64_t currentInterfaceId;
+        hstring currentInterfaceName;
+        {
+            std::scoped_lock lock(state->mutex);
+            state->active        = stage;
+            state->nativeStageId = static_cast<int32_t>(update.stage);
+            state->nativeError   = update.error.AsInteger();
+            if (update.completed && update.error == CHIP_NO_ERROR)
+            {
+                state->lastCompleted = stage;
+            }
+            if (update.retrying)
+            {
+                ++state->attemptNumber;
+                if (selectionMode == Controller::MatterNetworkInterfaceSelectionMode::PreferSpecifiedInterface)
+                {
+                    state->networkInterfaceId   = 0;
+                    state->networkInterfaceName = {};
+                }
+            }
+            lastCompleted        = state->lastCompleted;
+            attemptNumber        = state->attemptNumber;
+            currentInterfaceId   = state->networkInterfaceId;
+            currentInterfaceName = state->networkInterfaceName;
+        }
+        char const * nativeName = StageToString(update.stage);
+        hstring message = to_hstring(nativeName != nullptr && nativeName[0] != '\0' ? nativeName : "Unknown commissioning stage");
+        auto elapsed = std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start);
+        self->Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            stage, lastCompleted, static_cast<int32_t>(update.stage), ProjectCommissioningTransport(update.stage), elapsed,
+            message, message, currentInterfaceId, currentInterfaceName, attemptNumber, update.retrying));
+    };
+
+    uint64_t nodeId        = parameters.NodeId();
+    uint32_t setupPinCode  = parameters.SetupPinCode();
+    uint16_t discriminator = parameters.LongDiscriminator();
+    auto cancellationRequested = std::make_shared<std::atomic_bool>(false);
+    auto cancellation          = co_await get_cancellation_token();
+    cancellation.enable_propagation();
+    auto runtime = lifetime->mRuntime;
+    cancellation.callback([runtime, nodeId, cancellationRequested]() noexcept {
+        cancellationRequested->store(true, std::memory_order_release);
+        runtime->CancelCommission(nodeId);
+    });
+    co_await resume_background();
+    if (cancellation())
+    {
+        Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            Controller::MatterCommissioningStage::Failed, Controller::MatterCommissioningStage::Unknown, -1,
+            Controller::MatterCommissioningTransport::Bluetooth,
+            std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+            L"Commissioning was canceled.", L"Commissioning canceled", interfaceId, interfaceName, 1, false));
+        WaitForProgressDrain();
+        throw hresult_canceled();
+    }
+    try
+    {
+        auto node = mRuntime->Commission(nodeId, setupPinCode, discriminator, true, {}, nativeWiFi, threadDataset,
+                                         MakeOptional(nativeSelection), std::move(callback), cancellationRequested);
+        Controller::MatterCommissioningStage lastCompleted;
+        uint32_t attemptNumber;
+        uint64_t currentInterfaceId;
+        hstring currentInterfaceName;
+        {
+            std::scoped_lock lock(state->mutex);
+            lastCompleted        = state->lastCompleted;
+            attemptNumber        = state->attemptNumber;
+            currentInterfaceId   = state->networkInterfaceId;
+            currentInterfaceName = state->networkInterfaceName;
+        }
+        Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            Controller::MatterCommissioningStage::Completed, lastCompleted, -1,
+            Controller::MatterCommissioningTransport::OperationalIp,
+            std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+            L"Commissioning completed.", L"Commissioning complete", currentInterfaceId, currentInterfaceName, attemptNumber, false));
+        auto result = winrt::make<implementation::MatterCommissioningResult>(
+            true, Controller::MatterCommissioningOutcome::Succeeded, Controller::MatterCommissioningFailureKind::Unknown,
+            Controller::MatterCommissioningStage::Unknown, lastCompleted, -1, 0, L"Commissioning completed.", interfaceId, node);
+        WaitForProgressDrain();
+        co_return result;
+    }
+    catch (hresult_error const & error)
+    {
+        if (cancellationRequested->load(std::memory_order_acquire))
+        {
+            Controller::MatterCommissioningStage lastCompleted;
+            int32_t nativeStageId;
+            uint32_t attemptNumber;
+            uint64_t currentInterfaceId;
+            hstring currentInterfaceName;
+            {
+                std::scoped_lock lock(state->mutex);
+                lastCompleted        = state->lastCompleted;
+                nativeStageId        = state->nativeStageId;
+                attemptNumber        = state->attemptNumber;
+                currentInterfaceId   = state->networkInterfaceId;
+                currentInterfaceName = state->networkInterfaceName;
+            }
+            Publish(winrt::make<implementation::MatterCommissioningProgress>(
+                Controller::MatterCommissioningStage::Failed, lastCompleted, nativeStageId,
+                Controller::MatterCommissioningTransport::Unknown,
+                std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+                L"Commissioning was canceled.", L"Commissioning canceled", currentInterfaceId, currentInterfaceName,
+                attemptNumber, false));
+            WaitForProgressDrain();
+            throw hresult_canceled();
+        }
+        Controller::MatterCommissioningStage failedStage;
+        Controller::MatterCommissioningStage lastCompleted;
+        int32_t nativeStageId;
+        int32_t nativeError;
+        uint32_t attemptNumber;
+        uint64_t currentInterfaceId;
+        hstring currentInterfaceName;
+        {
+            std::scoped_lock lock(state->mutex);
+            failedStage         = state->active;
+            lastCompleted       = state->lastCompleted;
+            nativeStageId       = state->nativeStageId;
+            nativeError         = state->nativeError;
+            attemptNumber       = state->attemptNumber;
+            currentInterfaceId   = state->networkInterfaceId;
+            currentInterfaceName = state->networkInterfaceName;
+        }
+        bool timedOut = error.code() == HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            Controller::MatterCommissioningStage::Failed, lastCompleted, nativeStageId,
+            Controller::MatterCommissioningTransport::Unknown,
+            std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+            error.message(), L"Commissioning failed", currentInterfaceId, currentInterfaceName, attemptNumber, false));
+        auto result = winrt::make<implementation::MatterCommissioningResult>(
+            false, timedOut ? Controller::MatterCommissioningOutcome::TimedOut : Controller::MatterCommissioningOutcome::Failed,
+            ClassifyCommissioningFailure(failedStage, timedOut),
+            failedStage, lastCompleted, nativeStageId, nativeError, error.message(), interfaceId, nullptr);
+        WaitForProgressDrain();
+        co_return result;
+    }
 }
 
 Windows::Foundation::IAsyncAction MatterController::CloseAsync()

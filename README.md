@@ -31,6 +31,39 @@ structure fields, `value` wraps a scalar root, inspectable vectors represent
 Matter lists, and byte vectors represent octet strings. Responses use the same
 recursive representation.
 
+BLE network commissioning can report native stage transitions, elapsed time,
+transport changes, retries, and structured failures through the additive
+`MatterControllerCommissioning` class. Its `ProgressChanged` handlers run in
+order on a thread-pool thread rather than the UI thread. The returned
+`MatterCommissioningResult` distinguishes success, timeout, the failed stage,
+and common failure categories without requiring log parsing. Canceling the
+returned `IAsyncOperation` stops native pairing and completes the operation in
+the canceled state.
+
+`MatterNetworkInterfaceProvider.GetEligibleNetworkInterfacesAsync` enumerates
+interfaces that can participate in operational Matter discovery. Pass a
+`MatterNetworkInterfaceSelection` to choose automatic routing, prefer one
+interface with fallback, or require one interface without fallback. Interface
+identifiers are valid only while the adapter exists; enumerate again before a
+later commissioning operation. Interface selection is captured when
+commissioning starts and applies only to operational DNS-SD, address
+resolution, CASE, and commissioning-complete traffic. It does not affect BLE.
+
+```csharp
+var commissioning = new MatterControllerCommissioning(controller);
+commissioning.ProgressChanged += (_, progress) =>
+    Console.WriteLine($"{progress.Stage}: {progress.DiagnosticMessage}");
+
+var selection = new MatterNetworkInterfaceSelection(
+    MatterNetworkInterfaceSelectionMode.Automatic, 0);
+MatterCommissioningResult result =
+    await commissioning.CommissionBleAsync(parameters, selection);
+if (!result.Succeeded)
+{
+    throw new InvalidOperationException(result.DiagnosticMessage);
+}
+```
+
 This package is a development preview. Its WinRT contract is the intended
 application boundary, but preview releases do not yet guarantee ABI
 compatibility. Applications must deploy the native DLL from the same package
@@ -85,7 +118,7 @@ repository is not a GN source tree and does not create directory junctions to
 the SDK.
 
 The build produces
-`artifacts\Matter.Windows.Controller.0.1.0-preview.9.nupkg`. The package
+`artifacts\Matter.Windows.Controller.0.1.0-preview.10.nupkg`. The package
 contains a WinMD plus architecture-specific native DLLs for `win-x64` and
 `win-arm64`.
 
