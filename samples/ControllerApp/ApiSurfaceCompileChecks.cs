@@ -39,8 +39,9 @@ internal static class ApiSurfaceCompileChecks
             MatterNetworkInterfaceSelectionMode.Automatic,
             0);
         var commissioning = new MatterControllerCommissioning(controller);
-        commissioning.ProgressChanged += (_, progress) =>
+        commissioning.ProgressChanged += (sender, progress) =>
         {
+            _ = sender;
             MatterCommissioningStage stage = progress.Stage;
             MatterCommissioningTransport transport = progress.Transport;
             _ = (stage, transport, progress.LastCompletedStage, progress.NativeStageId,
