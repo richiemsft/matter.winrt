@@ -18,6 +18,8 @@ jobs:
   build:
     runs-on: windows-2025
     timeout-minutes: 120
+    env:
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - name: Enable long paths
@@ -28,6 +30,23 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           submodules: recursive
+
+      - name: Restore Windows build environment
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: matterforwindows/.environment/windows
+          key: winrt-windows-environment-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('matterforwindows/scripts/setup/windows.ps1', 'matterforwindows/scripts/setup/requirements.build.txt', 'matterforwindows/scripts/setup/constraints.txt') }}
+
+      - name: Restore NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.USERPROFILE }}\.nuget\packages
+          key: winrt-nuget-${{ runner.os }}-${{ hashFiles('NuGet.config', 'samples/**/*.csproj') }}
+
+      - name: Configure sccache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.16.0
 
       - name: Build package
         shell: pwsh

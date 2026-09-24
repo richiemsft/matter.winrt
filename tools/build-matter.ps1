@@ -71,7 +71,11 @@ $gnArgs = @(
     'chip_build_tools=false'
     'chip_caller_handles_critical_failure=true'
     'is_debug=false'
-) -join " "
+)
+if (Get-Command sccache.exe -ErrorAction SilentlyContinue) {
+    $gnArgs += 'cc_wrapper="sccache"'
+}
+$gnArgs = $gnArgs -join " "
 
 & $gn gen $outputDirectory "--root=$matterSdkRoot" "--dotfile=$dotfile" "--args=$gnArgs"
 if ($LASTEXITCODE -ne 0) {

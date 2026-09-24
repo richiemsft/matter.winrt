@@ -125,10 +125,15 @@ $sources = @(
     (Join-Path $winrtRoot "TimedInteractionOptions.cpp")
 )
 $objects = @()
+$sccache = Get-Command sccache.exe -ErrorAction SilentlyContinue
 foreach ($source in $sources) {
     $objectName = [System.IO.Path]::GetFileNameWithoutExtension($source) + ".obj"
     $object = Join-Path $objectDirectory $objectName
-    & cl.exe @compilerArguments /c $source "/Fo$object"
+    if ($sccache) {
+        & $sccache.Source cl.exe @compilerArguments /c $source "/Fo$object"
+    } else {
+        & cl.exe @compilerArguments /c $source "/Fo$object"
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "Compilation failed for $source."
     }
