@@ -19,6 +19,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 120
     env:
+      NUGET_PACKAGES: ${{ github.workspace }}\.nuget\packages
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -40,7 +41,7 @@ jobs:
       - name: Restore NuGet packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ env.USERPROFILE }}\.nuget\packages
+          path: ${{ env.NUGET_PACKAGES }}
           key: winrt-nuget-${{ runner.os }}-${{ hashFiles('NuGet.config', 'samples/**/*.csproj') }}
 
       - name: Configure sccache
