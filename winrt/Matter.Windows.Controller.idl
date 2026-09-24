@@ -1,4 +1,5 @@
 import "windows.foundation.idl";
+import "windows.storage.streams.idl";
 
 namespace Matter.Windows.Controller
 {
@@ -11,6 +12,70 @@ namespace Matter.Windows.Controller
         ConfiguringDevice = 4,
         Completing = 5,
         Complete = 6
+    };
+
+    enum MatterCommissioningStage
+    {
+        Unknown = 0,
+        SearchingForDevice = 1,
+        ConnectingOverBluetooth = 2,
+        EstablishingPase = 3,
+        ReadingCommissioningInformation = 4,
+        ConfiguringRegulatoryInformation = 5,
+        ProvisioningNetwork = 6,
+        ConnectingDeviceToNetwork = 7,
+        DiscoveringOperationalDevice = 8,
+        EstablishingCase = 9,
+        SendingCommissioningComplete = 10,
+        Completed = 11,
+        Failed = 12
+    };
+
+    enum MatterCommissioningTransport
+    {
+        Unknown = 0,
+        Bluetooth = 1,
+        WiFi = 2,
+        Thread = 3,
+        Ethernet = 4,
+        OperationalIp = 5
+    };
+
+    enum MatterCommissioningOutcome
+    {
+        Succeeded = 0,
+        Failed = 1,
+        TimedOut = 2
+    };
+
+    enum MatterCommissioningFailureKind
+    {
+        Unknown = 0,
+        DeviceNotFoundOverBluetooth = 1,
+        BluetoothConnectionFailed = 2,
+        PaseFailed = 3,
+        NetworkCredentialsRejected = 4,
+        DeviceNetworkConnectionFailed = 5,
+        OperationalDiscoveryTimedOut = 6,
+        CaseEstablishmentFailed = 7,
+        CommissioningCompleteFailed = 8,
+        OverallTimeout = 9
+    };
+
+    enum MatterNetworkInterfaceSelectionMode
+    {
+        Automatic = 0,
+        PreferSpecifiedInterface = 1,
+        RequireSpecifiedInterface = 2
+    };
+
+    enum MatterNetworkInterfaceType
+    {
+        Unknown = 0,
+        WiFi = 1,
+        Ethernet = 2,
+        Cellular = 3,
+        Thread = 4
     };
 
     runtimeclass ControllerOptions
@@ -40,10 +105,81 @@ namespace Matter.Windows.Controller
         UInt16 LongDiscriminator { get; set; };
     };
 
+    runtimeclass WiFiNetworkCredentials
+    {
+        WiFiNetworkCredentials(String ssid, String passphrase);
+        UInt32 SsidLength { get; };
+        UInt32 PassphraseLength { get; };
+    };
+
+    runtimeclass ThreadNetworkCredentials
+    {
+        ThreadNetworkCredentials(Windows.Storage.Streams.IBuffer operationalDataset);
+        UInt32 DatasetLength { get; };
+    };
+
+    runtimeclass BleNetworkCommissioningParameters
+    {
+        BleNetworkCommissioningParameters();
+        UInt64 NodeId { get; set; };
+        UInt32 SetupPinCode { get; set; };
+        UInt16 LongDiscriminator { get; set; };
+        WiFiNetworkCredentials WiFi { get; set; };
+        ThreadNetworkCredentials Thread { get; set; };
+    };
+
     runtimeclass CommissioningProgressEventArgs
     {
         CommissioningStage Stage { get; };
         String Message { get; };
+    };
+
+    runtimeclass MatterNetworkInterfaceSelection
+    {
+        MatterNetworkInterfaceSelection(MatterNetworkInterfaceSelectionMode mode, UInt64 interfaceId);
+        MatterNetworkInterfaceSelectionMode Mode { get; };
+        UInt64 InterfaceId { get; };
+    };
+
+    runtimeclass MatterNetworkInterface
+    {
+        UInt64 Id { get; };
+        UInt32 InterfaceIndex { get; };
+        String Name { get; };
+        MatterNetworkInterfaceType Type { get; };
+        Boolean IsConnected { get; };
+        Boolean SupportsIpv6 { get; };
+        Boolean SupportsMulticast { get; };
+        Boolean IsVirtual { get; };
+    };
+
+    runtimeclass MatterCommissioningProgress
+    {
+        MatterCommissioningStage Stage { get; };
+        MatterCommissioningStage LastCompletedStage { get; };
+        Int32 NativeStageId { get; };
+        MatterCommissioningTransport Transport { get; };
+        Windows.Foundation.TimeSpan ElapsedTime { get; };
+        String DiagnosticMessage { get; };
+        String DisplayMessage { get; };
+        UInt64 NetworkInterfaceId { get; };
+        String NetworkInterfaceName { get; };
+        UInt32 AttemptNumber { get; };
+        Boolean IsRetrying { get; };
+    };
+
+    runtimeclass MatterCommissioningResult
+    {
+        Boolean Succeeded { get; };
+        MatterCommissioningOutcome Outcome { get; };
+        MatterCommissioningFailureKind FailureKind { get; };
+        MatterCommissioningStage FailedStage { get; };
+        MatterCommissioningStage LastCompletedStage { get; };
+        Int32 NativeStageId { get; };
+        Int32 NativeErrorCode { get; };
+        String DiagnosticMessage { get; };
+        UInt64 NetworkInterfaceId { get; };
+        CommissionedNode Node { get; };
     };
 
     runtimeclass CommissionedNode
@@ -68,6 +204,15 @@ namespace Matter.Windows.Controller
         UInt32 CommandId { get; };
     };
 
+    runtimeclass EventPath
+    {
+        EventPath(UInt16 endpointId, UInt32 clusterId, UInt32 eventId, Boolean urgent);
+        UInt16 EndpointId { get; };
+        UInt32 ClusterId { get; };
+        UInt32 EventId { get; };
+        Boolean Urgent { get; };
+    };
+
     runtimeclass AttributeValue
     {
         AttributePath Path { get; };
@@ -78,6 +223,30 @@ namespace Matter.Windows.Controller
     {
         CommandPath Path { get; };
         Windows.Foundation.Collections.IPropertySet Data { get; };
+    };
+
+    runtimeclass TimedInteractionOptions
+    {
+        TimedInteractionOptions(UInt16 timeoutMilliseconds);
+        UInt16 TimeoutMilliseconds { get; };
+    };
+
+    runtimeclass EventValue
+    {
+        EventPath Path { get; };
+        UInt64 EventNumber { get; };
+        Windows.Foundation.Collections.IPropertySet Data { get; };
+    };
+
+    runtimeclass EventReportEventArgs
+    {
+        EventValue Value { get; };
+    };
+
+    runtimeclass EventSubscription
+    {
+        event Windows.Foundation.TypedEventHandler<EventSubscription, EventReportEventArgs> ReportReceived;
+        Windows.Foundation.IAsyncAction CloseAsync();
     };
 
     runtimeclass AttributeReportEventArgs
@@ -135,11 +304,42 @@ namespace Matter.Windows.Controller
         Windows.Foundation.IAsyncAction RemoveNodeAsync(UInt64 nodeId);
         Windows.Foundation.IAsyncOperation<AttributeValue> ReadAttributeAsync(UInt64 nodeId, AttributePath path);
         Windows.Foundation.IAsyncAction WriteAttributeAsync(UInt64 nodeId, AttributePath path, Windows.Foundation.Collections.IPropertySet value);
+        Windows.Foundation.IAsyncAction WriteAttributeTimedAsync(UInt64 nodeId, AttributePath path, Windows.Foundation.Collections.IPropertySet value, TimedInteractionOptions options);
         Windows.Foundation.IAsyncOperation<CommandResult> InvokeCommandAsync(UInt64 nodeId, CommandPath path, Windows.Foundation.Collections.IPropertySet arguments);
+        Windows.Foundation.IAsyncOperation<CommandResult> InvokeCommandTimedAsync(UInt64 nodeId, CommandPath path, Windows.Foundation.Collections.IPropertySet arguments, TimedInteractionOptions options);
         Windows.Foundation.IAsyncOperation<AttributeSubscription> SubscribeAttributeAsync(UInt64 nodeId, AttributePath path, UInt16 minimumIntervalSeconds, UInt16 maximumIntervalSeconds);
+        Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<EventValue> > ReadEventsAsync(UInt64 nodeId, EventPath path, UInt64 minimumEventNumber);
+        Windows.Foundation.IAsyncOperation<EventSubscription> SubscribeEventAsync(UInt64 nodeId, EventPath path, UInt64 minimumEventNumber, UInt16 minimumIntervalSeconds, UInt16 maximumIntervalSeconds);
         OnOffCluster GetOnOffCluster(UInt64 nodeId, UInt16 endpointId);
         LevelControlCluster GetLevelControlCluster(UInt64 nodeId, UInt16 endpointId);
         BasicInformationCluster GetBasicInformationCluster(UInt64 nodeId, UInt16 endpointId);
         Windows.Foundation.IAsyncAction CloseAsync();
+    };
+
+    runtimeclass MatterControllerRecovery
+    {
+        MatterControllerRecovery(MatterController controller);
+        Windows.Foundation.IAsyncOperation<CommissionedNode> RecoverNodeAsync(UInt64 nodeId);
+    };
+
+    runtimeclass MatterControllerNetworkCommissioning
+    {
+        MatterControllerNetworkCommissioning(MatterController controller);
+        Windows.Foundation.IAsyncOperation<CommissionedNode> CommissionBleAsync(BleNetworkCommissioningParameters parameters);
+    };
+
+    runtimeclass MatterNetworkInterfaceProvider
+    {
+        static Windows.Foundation.IAsyncOperation<Windows.Foundation.Collections.IVectorView<MatterNetworkInterface> >
+            GetEligibleNetworkInterfacesAsync();
+    };
+
+    runtimeclass MatterControllerCommissioning
+    {
+        MatterControllerCommissioning(MatterController controller);
+        event Windows.Foundation.TypedEventHandler<MatterControllerCommissioning, MatterCommissioningProgress> ProgressChanged;
+        Windows.Foundation.IAsyncOperation<MatterCommissioningResult> CommissionBleAsync(
+            BleNetworkCommissioningParameters parameters,
+            MatterNetworkInterfaceSelection interfaceSelection);
     };
 }

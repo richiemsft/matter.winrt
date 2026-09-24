@@ -16,3 +16,17 @@ attestation by default. It is not production security infrastructure.
 For multi-admin commissioning, request a sharing code from the device's
 existing controller and set `OnNetworkCommissioningParameters.SetupCode` to
 the manual code or `MT:` QR payload before calling `CommissionOnNetworkAsync`.
+
+For factory-reset Wi-Fi or Thread devices, use
+`MatterControllerCommissioning.CommissionBleAsync`. Its ordered
+`ProgressChanged` event runs on a worker thread and reports typed stages,
+elapsed time, retries, transport, and the selected operational interface.
+The returned `MatterCommissioningResult` contains structured failure details.
+Canceling the WinRT asynchronous operation stops native pairing.
+
+Use `MatterNetworkInterfaceProvider.GetEligibleNetworkInterfacesAsync` before
+commissioning when an application needs to select an adapter. Automatic mode
+retains normal Windows routing. Prefer mode tries the selected interface first
+and may fall back; Require mode does not fall back and validates that the
+adapter is connected and supports IPv6 multicast. Adapter identifiers are
+ephemeral and should be enumerated again before a later operation.

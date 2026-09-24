@@ -4,10 +4,12 @@
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
   xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   xmlns:systemai="http://schemas.microsoft.com/appx/manifest/systemai/windows10"
-  IgnorableNamespaces="uap uap5 rescap systemai">
+  IgnorableNamespaces="uap uap3 uap5 com rescap systemai">
 
   <Identity
     Name="8CD7FDAD-DB9C-4DF7-9FA7-6FEAA21BC354"
@@ -44,6 +46,64 @@
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
         <uap:SplashScreen Image="Assets\SplashScreen.png" />
       </uap:VisualElements>
+      <Extensions>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:ExeServer
+              Executable="MatterControllerApp.exe"
+              Arguments="-RegisterProcessAsComServer"
+              DisplayName="Matter Controls Widget Provider">
+              <com:Class
+                Id="A4EC39EB-5440-4B4E-828F-2AF7D8D8CE51"
+                DisplayName="Matter Controls Widget Provider" />
+            </com:ExeServer>
+          </com:ComServer>
+        </com:Extension>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension
+            Name="com.microsoft.windows.widgets"
+            DisplayName="Matter Controller"
+            Id="MatterControllerApp.Widgets"
+            PublicFolder="Public">
+            <uap3:Properties>
+              <WidgetProvider>
+                <ProviderIcons>
+                  <Icon Path="Assets\StoreLogo.png" />
+                </ProviderIcons>
+                <Activation>
+                  <CreateInstance ClassId="A4EC39EB-5440-4B4E-828F-2AF7D8D8CE51" />
+                </Activation>
+                <Definitions>
+                  <Definition
+                    Id="Matter_Controls_Widget"
+                    DisplayName="Matter Controls"
+                    Description="Control selected Matter lights and switches."
+                    AllowMultiple="false">
+                    <Capabilities>
+                      <Capability>
+                        <Size Name="medium" />
+                      </Capability>
+                      <Capability>
+                        <Size Name="large" />
+                      </Capability>
+                    </Capabilities>
+                    <ThemeResources>
+                      <Icons>
+                        <Icon Path="Assets\Square44x44Logo.png" />
+                      </Icons>
+                      <Screenshots>
+                        <Screenshot
+                          Path="Assets\Wide310x150Logo.png"
+                          DisplayAltText="Matter Controls widget" />
+                      </Screenshots>
+                    </ThemeResources>
+                  </Definition>
+                </Definitions>
+              </WidgetProvider>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+      </Extensions>
     </Application>
   </Applications>
 
@@ -66,5 +126,7 @@
     <Capability Name="internetClient" />
     <Capability Name="privateNetworkClientServer" />
     <DeviceCapability Name="bluetooth" />
+    <DeviceCapability Name="pointOfService" />
+    <DeviceCapability Name="webcam" />
   </Capabilities>
 </Package>

@@ -86,6 +86,49 @@
       <summary>Gets or sets the device's 12-bit discriminator.</summary>
     </member>
 
+    <member name="T:Matter.Windows.Controller.WiFiNetworkCredentials">
+      <summary>Holds transient Wi-Fi credentials for one commissioning operation.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.WiFiNetworkCredentials.#ctor(System.String,System.String)">
+      <summary>Copies a Wi-Fi SSID and passphrase into bounded native buffers. The native copies are cleared when this object is released.</summary><param name="ssid">The nonempty Wi-Fi SSID, limited to 32 UTF-8 bytes.</param><param name="passphrase">The Wi-Fi passphrase, or an empty string for an open network, limited to 64 UTF-8 bytes.</param>
+    </member>
+    <member name="P:Matter.Windows.Controller.WiFiNetworkCredentials.SsidLength">
+      <summary>Gets the SSID length in UTF-8 bytes without exposing its value.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.WiFiNetworkCredentials.PassphraseLength">
+      <summary>Gets the passphrase length in UTF-8 bytes without exposing its value.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.ThreadNetworkCredentials">
+      <summary>Holds a transient Thread operational dataset for one commissioning operation.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.ThreadNetworkCredentials.#ctor(Windows.Storage.Streams.IBuffer)">
+      <summary>Copies a Thread operational dataset into a bounded native buffer. The native copy is cleared when this object is released.</summary><param name="operationalDataset">A complete Thread operational dataset containing between 1 and 254 bytes. The caller may release or clear the source buffer after construction.</param>
+    </member>
+    <member name="P:Matter.Windows.Controller.ThreadNetworkCredentials.DatasetLength">
+      <summary>Gets the operational dataset length without exposing its contents.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.BleNetworkCommissioningParameters">
+      <summary>Describes Bluetooth LE commissioning of a factory-reset Wi-Fi or Thread device.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.BleNetworkCommissioningParameters.#ctor">
+      <summary>Creates Bluetooth LE network commissioning parameters.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.BleNetworkCommissioningParameters.NodeId">
+      <summary>Gets or sets the nonzero operational node identifier to assign to the device.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.BleNetworkCommissioningParameters.SetupPinCode">
+      <summary>Gets or sets the device setup PIN.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.BleNetworkCommissioningParameters.LongDiscriminator">
+      <summary>Gets or sets the device's 12-bit discriminator.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.BleNetworkCommissioningParameters.WiFi">
+      <summary>Gets or sets Wi-Fi credentials. Set exactly one of WiFi or Thread.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.BleNetworkCommissioningParameters.Thread">
+      <summary>Gets or sets Thread credentials. Set exactly one of WiFi or Thread.</summary>
+    </member>
+
     <member name="T:Matter.Windows.Controller.CommissioningProgressEventArgs">
       <summary>Provides commissioning stage and status text.</summary>
     </member>
@@ -94,6 +137,102 @@
     </member>
     <member name="P:Matter.Windows.Controller.CommissioningProgressEventArgs.Message">
       <summary>Gets a human-readable description of the current stage.</summary>
+    </member>
+
+    <member name="T:Matter.Windows.Controller.MatterCommissioningStage">
+      <summary>Identifies an application-facing commissioning stage. Unknown native stages remain observable through NativeStageId.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterCommissioningTransport">
+      <summary>Identifies the transport associated with a commissioning progress update.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterCommissioningOutcome">
+      <summary>Identifies whether commissioning succeeded, failed, or timed out.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterCommissioningFailureKind">
+      <summary>Classifies common terminal commissioning failures without requiring diagnostic-message parsing.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceSelectionMode">
+      <summary>Controls whether operational Matter traffic uses normal routing, prefers one interface, or requires one interface.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceType">
+      <summary>Identifies the physical network technology reported for an interface.</summary>
+    </member>
+
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceSelection">
+      <summary>Captures the operational network-interface policy for one commissioning operation.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterNetworkInterfaceSelection.#ctor(Matter.Windows.Controller.MatterNetworkInterfaceSelectionMode,System.UInt64)">
+      <summary>Creates an immutable interface selection.</summary>
+      <param name="mode">The automatic, preferred, or required selection policy.</param>
+      <param name="interfaceId">The identifier returned by MatterNetworkInterfaceProvider, or zero for automatic mode.</param>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterfaceSelection.Mode"><summary>Gets the captured selection policy.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterfaceSelection.InterfaceId"><summary>Gets the selected adapter identifier, or zero for automatic mode.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterface">
+      <summary>Describes a Windows network interface eligible for Matter operational discovery.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.Id"><summary>Gets the adapter identifier used by MatterNetworkInterfaceSelection. Re-enumerate before later operations because identifiers are valid only while adapters exist.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.InterfaceIndex"><summary>Gets the Windows interface index.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.Name"><summary>Gets the adapter name.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.Type"><summary>Gets the reported network technology.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.IsConnected"><summary>Gets whether the interface is currently up.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.SupportsIpv6"><summary>Gets whether the interface currently has an IPv6 address.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.SupportsMulticast"><summary>Gets whether the interface supports multicast.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterNetworkInterface.IsVirtual"><summary>Gets whether the adapter name identifies a common virtual or VPN interface.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterCommissioningProgress">
+      <summary>Provides an immutable snapshot of commissioning progress. It never contains setup codes or network credentials.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.Stage"><summary>Gets the current application-facing stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.LastCompletedStage"><summary>Gets the last successfully completed application-facing stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.NativeStageId"><summary>Gets the native Matter SDK stage identifier, or -1 when no native stage applies.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.Transport"><summary>Gets the transport associated with the current stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.ElapsedTime"><summary>Gets the elapsed time since this commissioning operation started.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.DiagnosticMessage"><summary>Gets stable, nonlocalized diagnostic text that does not contain credentials or setup codes.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.DisplayMessage"><summary>Gets text suitable for display by preview applications. Applications should localize their own text based on Stage for production UI.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.NetworkInterfaceId"><summary>Gets the selected operational interface identifier, or zero for automatic selection.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.NetworkInterfaceName"><summary>Gets the selected operational interface name, or an empty string when automatic selection has not chosen one.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.AttemptNumber"><summary>Gets the one-based attempt number for the current operation.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningProgress.IsRetrying"><summary>Gets whether the update reports a recoverable retry rather than terminal failure.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterCommissioningResult">
+      <summary>Contains the structured terminal result of commissioning. Cancellation instead completes the WinRT asynchronous operation in the canceled state.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.Succeeded"><summary>Gets whether commissioning completed successfully.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.Outcome"><summary>Gets the terminal success, failure, or timeout outcome.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.FailureKind"><summary>Gets the classified failure kind, or Unknown when no reliable classification is available.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.FailedStage"><summary>Gets the application-facing stage active when the operation failed.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.LastCompletedStage"><summary>Gets the last successfully completed application-facing stage.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.NativeStageId"><summary>Gets the native Matter SDK stage identifier, or -1 when unavailable.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.NativeErrorCode"><summary>Gets the native CHIP error integer, or zero when unavailable.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.DiagnosticMessage"><summary>Gets terminal diagnostic text without setup codes or network credentials.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.NetworkInterfaceId"><summary>Gets the requested operational interface identifier, or zero for automatic selection.</summary></member>
+    <member name="P:Matter.Windows.Controller.MatterCommissioningResult.Node"><summary>Gets the commissioned node after success, or null after failure or timeout.</summary></member>
+
+    <member name="T:Matter.Windows.Controller.MatterNetworkInterfaceProvider">
+      <summary>Enumerates network interfaces that may participate in Matter operational discovery.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterNetworkInterfaceProvider.GetEligibleNetworkInterfacesAsync">
+      <summary>Enumerates current non-loopback interfaces. Virtual and VPN interfaces remain visible and are identified by IsVirtual.</summary>
+      <returns>A snapshot of currently eligible interfaces.</returns>
+    </member>
+
+    <member name="T:Matter.Windows.Controller.MatterControllerCommissioning">
+      <summary>Adds structured BLE network commissioning, progress, cancellation, and per-operation interface selection without changing the MatterController ABI.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterControllerCommissioning.#ctor(Matter.Windows.Controller.MatterController)">
+      <summary>Creates commissioning operations for a controller.</summary>
+      <param name="controller">The controller that will own commissioned nodes.</param>
+    </member>
+    <member name="E:Matter.Windows.Controller.MatterControllerCommissioning.ProgressChanged">
+      <summary>Occurs in order on a worker thread when commissioning changes stage or retries. Handlers are drained before the operation reaches its terminal state and must marshal UI work to the application's dispatcher.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterControllerCommissioning.CommissionBleAsync(Matter.Windows.Controller.BleNetworkCommissioningParameters,Matter.Windows.Controller.MatterNetworkInterfaceSelection)">
+      <summary>Commissions a factory-reset Wi-Fi or Thread device over BLE. Interface selection is captured at start and applies to operational DNS-SD, address resolution, CASE, and commissioning-complete traffic, not BLE. Canceling the returned operation stops native pairing and completes in the canceled state.</summary>
+      <param name="parameters">BLE setup data and exactly one Wi-Fi or Thread credential set.</param>
+      <param name="interfaceSelection">The operational-interface policy, or null to use automatic routing.</param>
+      <returns>A structured success, failure, or timeout result.</returns>
     </member>
 
     <member name="T:Matter.Windows.Controller.CommissionedNode">
@@ -132,6 +271,21 @@
     <member name="P:Matter.Windows.Controller.CommandPath.ClusterId"><summary>Gets the cluster identifier.</summary></member>
     <member name="P:Matter.Windows.Controller.CommandPath.CommandId"><summary>Gets the command identifier.</summary></member>
 
+    <member name="T:Matter.Windows.Controller.EventPath">
+      <summary>Identifies a Matter event by endpoint, cluster, and event identifiers.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.EventPath.#ctor(System.UInt16,System.UInt32,System.UInt32,System.Boolean)">
+      <summary>Creates an event path.</summary>
+      <param name="endpointId">The endpoint identifier.</param>
+      <param name="clusterId">The cluster identifier.</param>
+      <param name="eventId">The event identifier.</param>
+      <param name="urgent">Whether the subscription requests urgent delivery.</param>
+    </member>
+    <member name="P:Matter.Windows.Controller.EventPath.EndpointId"><summary>Gets the endpoint identifier.</summary></member>
+    <member name="P:Matter.Windows.Controller.EventPath.ClusterId"><summary>Gets the cluster identifier.</summary></member>
+    <member name="P:Matter.Windows.Controller.EventPath.EventId"><summary>Gets the event identifier.</summary></member>
+    <member name="P:Matter.Windows.Controller.EventPath.Urgent"><summary>Gets whether urgent event delivery is requested.</summary></member>
+
     <member name="T:Matter.Windows.Controller.AttributeValue">
       <summary>Contains a generic Matter attribute path and decoded value.</summary>
     </member>
@@ -144,6 +298,27 @@
     </member>
     <member name="P:Matter.Windows.Controller.CommandResult.Path"><summary>Gets the invoked command path.</summary></member>
     <member name="P:Matter.Windows.Controller.CommandResult.Data"><summary>Gets the decoded command response fields.</summary></member>
+    <member name="T:Matter.Windows.Controller.TimedInteractionOptions">
+      <summary>Configures the timeout for a Matter timed write or invoke transaction.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.TimedInteractionOptions.#ctor(System.UInt16)">
+      <summary>Creates timed interaction options.</summary>
+      <param name="timeoutMilliseconds">The nonzero timeout, in milliseconds, for the Timed Request.</param>
+    </member>
+    <member name="P:Matter.Windows.Controller.TimedInteractionOptions.TimeoutMilliseconds">
+      <summary>Gets the Timed Request timeout in milliseconds.</summary>
+    </member>
+    <member name="T:Matter.Windows.Controller.EventValue">
+      <summary>Contains a generic Matter event path, event number, and decoded payload.</summary>
+    </member>
+    <member name="P:Matter.Windows.Controller.EventValue.Path"><summary>Gets the reported event path.</summary></member>
+    <member name="P:Matter.Windows.Controller.EventValue.EventNumber"><summary>Gets the monotonically increasing event number assigned by the device.</summary></member>
+    <member name="P:Matter.Windows.Controller.EventValue.Data"><summary>Gets the decoded event fields.</summary></member>
+    <member name="T:Matter.Windows.Controller.EventReportEventArgs"><summary>Provides an event value emitted by a subscription.</summary></member>
+    <member name="P:Matter.Windows.Controller.EventReportEventArgs.Value"><summary>Gets the reported event value.</summary></member>
+    <member name="T:Matter.Windows.Controller.EventSubscription"><summary>Represents an active Matter event subscription.</summary></member>
+    <member name="E:Matter.Windows.Controller.EventSubscription.ReportReceived"><summary>Occurs when the device reports an event.</summary></member>
+    <member name="M:Matter.Windows.Controller.EventSubscription.CloseAsync"><summary>Closes the subscription and releases its Interaction Model exchange.</summary><returns>An asynchronous close action.</returns></member>
     <member name="T:Matter.Windows.Controller.AttributeReportEventArgs"><summary>Provides an attribute value emitted by a subscription.</summary></member>
     <member name="P:Matter.Windows.Controller.AttributeReportEventArgs.Value"><summary>Gets the reported attribute value.</summary></member>
 
@@ -221,12 +396,27 @@
     <member name="M:Matter.Windows.Controller.MatterController.CommissionBleAsync(Matter.Windows.Controller.BleCommissioningParameters)">
       <summary>Commissions a device over Bluetooth LE.</summary><param name="parameters">BLE commissioning parameters.</param><returns>The persisted commissioned node.</returns>
     </member>
+    <member name="T:Matter.Windows.Controller.MatterControllerNetworkCommissioning">
+      <summary>Adds factory-reset Wi-Fi or Thread devices through Bluetooth LE without changing the MatterController ABI.</summary>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterControllerNetworkCommissioning.#ctor(Matter.Windows.Controller.MatterController)">
+      <summary>Creates network commissioning operations for a controller.</summary><param name="controller">The controller that will own the commissioned node.</param>
+    </member>
+    <member name="M:Matter.Windows.Controller.MatterControllerNetworkCommissioning.CommissionBleAsync(Matter.Windows.Controller.BleNetworkCommissioningParameters)">
+      <summary>Commissions a factory-reset device over Bluetooth LE and supplies its Wi-Fi or Thread credentials during network configuration.</summary><param name="parameters">BLE and network commissioning parameters containing exactly one credential type.</param><returns>The persisted commissioned node.</returns>
+    </member>
     <member name="P:Matter.Windows.Controller.MatterController.CommissionedNodes"><summary>Gets a snapshot of nodes persisted by this controller.</summary></member>
+    <member name="M:Matter.Windows.Controller.MatterControllerRecovery.#ctor(Matter.Windows.Controller.MatterController)"><summary>Creates node recovery operations for a controller.</summary><param name="controller">The controller whose fabric contains the node.</param></member>
+    <member name="M:Matter.Windows.Controller.MatterControllerRecovery.RecoverNodeAsync(System.UInt64)"><summary>Verifies an existing operational node on the current fabric and restores it to the persisted node index.</summary><param name="nodeId">The node identifier previously assigned on this fabric.</param><returns>The recovered commissioned node.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.RemoveNodeAsync(System.UInt64)"><summary>Starts removing a node from the fabric and persisted node index.</summary><param name="nodeId">The node identifier.</param><returns>An asynchronous action.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.ReadAttributeAsync(System.UInt64,Matter.Windows.Controller.AttributePath)"><summary>Reads and recursively decodes a Matter attribute.</summary><param name="nodeId">The node identifier.</param><param name="path">The attribute path.</param><returns>The decoded attribute value.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.WriteAttributeAsync(System.UInt64,Matter.Windows.Controller.AttributePath,System.Collections.Generic.IDictionary{System.String,System.Object})"><summary>Encodes and writes a generic Matter attribute value.</summary><param name="nodeId">The node identifier.</param><param name="path">The attribute path.</param><param name="value">The generic TLV property-set representation.</param><returns>An asynchronous action.</returns></member>
+    <member name="M:Matter.Windows.Controller.MatterController.WriteAttributeTimedAsync(System.UInt64,Matter.Windows.Controller.AttributePath,System.Collections.Generic.IDictionary{System.String,System.Object},Matter.Windows.Controller.TimedInteractionOptions)"><summary>Encodes and writes a generic Matter attribute using a timed transaction.</summary><param name="nodeId">The node identifier.</param><param name="path">The attribute path.</param><param name="value">The generic TLV property-set representation.</param><param name="options">The nonzero Timed Request timeout.</param><returns>An asynchronous action.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.InvokeCommandAsync(System.UInt64,Matter.Windows.Controller.CommandPath,System.Collections.Generic.IDictionary{System.String,System.Object})"><summary>Encodes and invokes a generic Matter command.</summary><param name="nodeId">The node identifier.</param><param name="path">The command path.</param><param name="arguments">Command fields keyed by decimal context tag.</param><returns>The decoded command response.</returns></member>
+    <member name="M:Matter.Windows.Controller.MatterController.InvokeCommandTimedAsync(System.UInt64,Matter.Windows.Controller.CommandPath,System.Collections.Generic.IDictionary{System.String,System.Object},Matter.Windows.Controller.TimedInteractionOptions)"><summary>Encodes and invokes a generic Matter command using a timed transaction.</summary><param name="nodeId">The node identifier.</param><param name="path">The command path.</param><param name="arguments">Command fields keyed by decimal context tag.</param><param name="options">The nonzero Timed Request timeout.</param><returns>The decoded command response.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.SubscribeAttributeAsync(System.UInt64,Matter.Windows.Controller.AttributePath,System.UInt16,System.UInt16)"><summary>Establishes a generic attribute subscription.</summary><param name="nodeId">The node identifier.</param><param name="path">The attribute path.</param><param name="minimumIntervalSeconds">The minimum reporting interval.</param><param name="maximumIntervalSeconds">The maximum reporting interval.</param><returns>The established subscription.</returns></member>
+    <member name="M:Matter.Windows.Controller.MatterController.ReadEventsAsync(System.UInt64,Matter.Windows.Controller.EventPath,System.UInt64)"><summary>Reads retained events on an exact Matter event path.</summary><param name="nodeId">The node identifier.</param><param name="path">The event path.</param><param name="minimumEventNumber">The first event number to return, or zero for all retained events.</param><returns>The decoded events in report order.</returns></member>
+    <member name="M:Matter.Windows.Controller.MatterController.SubscribeEventAsync(System.UInt64,Matter.Windows.Controller.EventPath,System.UInt64,System.UInt16,System.UInt16)"><summary>Establishes a subscription for an exact Matter event path.</summary><param name="nodeId">The node identifier.</param><param name="path">The event path.</param><param name="minimumEventNumber">The first retained event number to report, or zero for all retained events.</param><param name="minimumIntervalSeconds">The minimum reporting interval.</param><param name="maximumIntervalSeconds">The maximum reporting interval.</param><returns>The established subscription.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.GetOnOffCluster(System.UInt64,System.UInt16)"><summary>Creates a typed On/Off cluster client.</summary><param name="nodeId">The node identifier.</param><param name="endpointId">The endpoint identifier.</param><returns>The cluster client.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.GetLevelControlCluster(System.UInt64,System.UInt16)"><summary>Creates a typed Level Control cluster client.</summary><param name="nodeId">The node identifier.</param><param name="endpointId">The endpoint identifier.</param><returns>The cluster client.</returns></member>
     <member name="M:Matter.Windows.Controller.MatterController.GetBasicInformationCluster(System.UInt64,System.UInt16)"><summary>Creates a typed Basic Information cluster client.</summary><param name="nodeId">The node identifier.</param><param name="endpointId">The endpoint identifier.</param><returns>The cluster client.</returns></member>

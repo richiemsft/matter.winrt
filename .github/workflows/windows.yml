@@ -1,0 +1,113 @@
+name: Windows
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      NUGET_PACKAGES: ${{ github.workspace }}\.nuget\packages
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Enable long paths
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Restore Windows build environment
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: matterforwindows/.environment/windows
+          key: winrt-windows-environment-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('matterforwindows/scripts/setup/windows.ps1', 'matterforwindows/scripts/setup/requirements.build.txt', 'matterforwindows/scripts/setup/constraints.txt') }}
+
+      - name: Restore NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: winrt-nuget-${{ runner.os }}-${{ hashFiles('NuGet.config', 'samples/**/*.csproj') }}
+
+      - name: Configure sccache
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.16.0
+
+      - name: Build package
+        shell: pwsh
+        run: .\tools\build.ps1 -Architecture all
+
+      - name: Build sample consumers
+        shell: pwsh
+        run: |
+          dotnet restore .\samples\ControllerApp\MatterControllerApp.csproj `
+            -p:Platform=x64 -p:Configuration=Release `
+            --configfile .\NuGet.config --force --no-cache
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build .\samples\ControllerApp\MatterControllerApp.csproj `
+            -c Release -p:Platform=x64 --no-restore --nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet restore .\samples\ControllerApp\MatterControllerApp.csproj `
+            -p:Platform=ARM64 -p:Configuration=Release `
+            --configfile .\NuGet.config --force --no-cache
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build .\samples\ControllerApp\MatterControllerApp.csproj `
+            -c Release -p:Platform=ARM64 --no-restore --nologo
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download compatibility baseline
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'baseline.nupkg'
+          $archive = Join-Path $env:RUNNER_TEMP 'baseline.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'baseline'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/dotMorten/matter.winrt/releases/download/v0.1.0-preview.8/Matter.Windows.Controller.0.1.0-preview.8.nupkg' `
+            -OutFile $package
+          $expectedHash = '82C970ECE9B76209F80EE694523A57F52E3106F03947A0E78D4D5BB376D40199'
+          $actualHash = (Get-FileHash $package -Algorithm SHA256).Hash
+          if ($actualHash -ne $expectedHash) {
+            throw "Compatibility baseline hash mismatch. Expected $expectedHash; got $actualHash."
+          }
+          Copy-Item $package $archive
+          Expand-Archive $archive $destination
+          "BASELINE_WINMD=$(Join-Path $destination 'winmd\Matter.Windows.Controller.winmd')" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Validate ABI
+        shell: pwsh
+        run: |
+          . .\matterforwindows\scripts\setup\windows.ps1 -Architecture x64
+          $nativeDlls = @(
+            '.\out\win-winrt-x64\Matter.Windows.Controller.dll'
+            '.\out\win-winrt-arm64\Matter.Windows.Controller.dll'
+          )
+          .\tools\verify-abi.ps1 `
+            -BaselineWinmd $env:BASELINE_WINMD `
+            -CurrentWinmd .\out\win-winrt-x64\Matter.Windows.Controller.winmd `
+            -EquivalentWinmd .\out\win-winrt-arm64\Matter.Windows.Controller.winmd `
+            -NativeDll $nativeDlls
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: Matter.Windows.Controller
+          path: artifacts/Matter.Windows.Controller.*.nupkg
+          if-no-files-found: error
+          retention-days: 14

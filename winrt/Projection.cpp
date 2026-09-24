@@ -15,8 +15,10 @@
 #include <credentials/GroupDataProviderImpl.h>
 #include <credentials/PersistentStorageOpCertStore.h>
 #include <credentials/attestation_verifier/DefaultDeviceAttestationVerifier.h>
+#include <crypto/CHIPCryptoPAL.h>
 #include <crypto/PersistentStorageOperationalKeystore.h>
 #include <crypto/RawKeySessionKeystore.h>
+#include <inet/InetInterface.h>
 #include <lib/support/CHIPMem.h>
 #include <lib/support/TestGroupData.h>
 #include <lib/core/TLV.h>
@@ -26,14 +28,19 @@
 #include <platform/Windows/ConfigurationManagerImpl.h>
 #include <setup_payload/ManualSetupPayloadGenerator.h>
 #include <setup_payload/SetupPayload.h>
+#include <winrt/Windows.System.Threading.h>
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <array>
+#include <cctype>
 #include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -48,9 +55,119 @@ using namespace chip::DeviceLayer;
 
 constexpr FabricId kControllerFabricId = 1;
 constexpr auto kCommissioningTimeout    = std::chrono::seconds(120);
+constexpr auto kCommissioningFailureDetailTimeout = std::chrono::milliseconds(100);
 constexpr auto kInteractionTimeout      = std::chrono::seconds(30);
+constexpr auto kTimedInteractionMargin  = std::chrono::seconds(5);
 constexpr char kCommissionedNodesKey[] = "winrt/nodes";
 constexpr size_t kGenericTlvBufferSize = 64 * 1024;
+constexpr size_t kMaximumPendingReports = 256;
+
+struct NativeCommissioningProgress
+{
+    chip::Controller::CommissioningStage stage;
+    CHIP_ERROR error = CHIP_NO_ERROR;
+    bool completed   = false;
+    bool retrying    = false;
+};
+
+using CommissioningProgressCallback = std::function<void(const NativeCommissioningProgress &)>;
+
+Controller::MatterCommissioningStage ProjectCommissioningStage(chip::Controller::CommissioningStage stage)
+{
+    switch (stage)
+    {
+    case chip::Controller::CommissioningStage::kSecurePairing:
+        return Controller::MatterCommissioningStage::EstablishingPase;
+    case chip::Controller::CommissioningStage::kReadCommissioningInfo:
+        return Controller::MatterCommissioningStage::ReadingCommissioningInformation;
+    case chip::Controller::CommissioningStage::kConfigRegulatory:
+        return Controller::MatterCommissioningStage::ConfiguringRegulatoryInformation;
+    case chip::Controller::CommissioningStage::kWiFiNetworkSetup:
+    case chip::Controller::CommissioningStage::kThreadNetworkSetup:
+    case chip::Controller::CommissioningStage::kRequestWiFiCredentials:
+    case chip::Controller::CommissioningStage::kRequestThreadCredentials:
+        return Controller::MatterCommissioningStage::ProvisioningNetwork;
+    case chip::Controller::CommissioningStage::kWiFiNetworkEnable:
+    case chip::Controller::CommissioningStage::kThreadNetworkEnable:
+        return Controller::MatterCommissioningStage::ConnectingDeviceToNetwork;
+    case chip::Controller::CommissioningStage::kFindOperationalForStayActive:
+    case chip::Controller::CommissioningStage::kFindOperationalForCommissioningComplete:
+        return Controller::MatterCommissioningStage::DiscoveringOperationalDevice;
+    case chip::Controller::CommissioningStage::kSendComplete:
+        return Controller::MatterCommissioningStage::SendingCommissioningComplete;
+    default:
+        return Controller::MatterCommissioningStage::Unknown;
+    }
+}
+
+Controller::MatterCommissioningTransport ProjectCommissioningTransport(chip::Controller::CommissioningStage stage)
+{
+    if (stage == chip::Controller::CommissioningStage::kFindOperationalForStayActive ||
+        stage == chip::Controller::CommissioningStage::kFindOperationalForCommissioningComplete ||
+        stage == chip::Controller::CommissioningStage::kSendComplete)
+    {
+        return Controller::MatterCommissioningTransport::OperationalIp;
+    }
+    if (stage == chip::Controller::CommissioningStage::kWiFiNetworkSetup ||
+        stage == chip::Controller::CommissioningStage::kWiFiNetworkEnable)
+    {
+        return Controller::MatterCommissioningTransport::WiFi;
+    }
+    if (stage == chip::Controller::CommissioningStage::kThreadNetworkSetup ||
+        stage == chip::Controller::CommissioningStage::kThreadNetworkEnable)
+    {
+        return Controller::MatterCommissioningTransport::Thread;
+    }
+    return Controller::MatterCommissioningTransport::Bluetooth;
+}
+
+Controller::MatterCommissioningFailureKind ClassifyCommissioningFailure(Controller::MatterCommissioningStage stage,
+                                                                        bool timedOut)
+{
+    switch (stage)
+    {
+    case Controller::MatterCommissioningStage::SearchingForDevice:
+        return Controller::MatterCommissioningFailureKind::DeviceNotFoundOverBluetooth;
+    case Controller::MatterCommissioningStage::ConnectingOverBluetooth:
+        return Controller::MatterCommissioningFailureKind::BluetoothConnectionFailed;
+    case Controller::MatterCommissioningStage::EstablishingPase:
+        return Controller::MatterCommissioningFailureKind::PaseFailed;
+    case Controller::MatterCommissioningStage::ProvisioningNetwork:
+        return Controller::MatterCommissioningFailureKind::NetworkCredentialsRejected;
+    case Controller::MatterCommissioningStage::ConnectingDeviceToNetwork:
+        return Controller::MatterCommissioningFailureKind::DeviceNetworkConnectionFailed;
+    case Controller::MatterCommissioningStage::DiscoveringOperationalDevice:
+        return Controller::MatterCommissioningFailureKind::OperationalDiscoveryTimedOut;
+    case Controller::MatterCommissioningStage::EstablishingCase:
+        return Controller::MatterCommissioningFailureKind::CaseEstablishmentFailed;
+    case Controller::MatterCommissioningStage::SendingCommissioningComplete:
+        return Controller::MatterCommissioningFailureKind::CommissioningCompleteFailed;
+    default:
+        return timedOut ? Controller::MatterCommissioningFailureKind::OverallTimeout
+                        : Controller::MatterCommissioningFailureKind::Unknown;
+    }
+}
+
+std::vector<uint8_t> Utf8Bytes(hstring const & value)
+{
+    std::string encoded = to_string(value);
+    std::vector<uint8_t> bytes(encoded.begin(), encoded.end());
+    if (!encoded.empty())
+    {
+        Crypto::ClearSecretData(reinterpret_cast<uint8_t *>(encoded.data()), encoded.size());
+    }
+    return bytes;
+}
+
+std::chrono::milliseconds InteractionWaitTimeout(std::optional<uint16_t> timedInteractionTimeout)
+{
+    auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(kInteractionTimeout);
+    if (timedInteractionTimeout.has_value())
+    {
+        timeout += std::chrono::milliseconds(*timedInteractionTimeout) + kTimedInteractionMargin;
+    }
+    return timeout;
+}
 
 [[noreturn]] void ThrowChipError(CHIP_ERROR error, wchar_t const * operation)
 {
@@ -317,28 +434,163 @@ struct PairingState
     std::condition_variable condition;
     bool complete = false;
     CHIP_ERROR error = CHIP_NO_ERROR;
+    Optional<chip::Controller::CommissioningStage> activeStage;
+    Optional<chip::Controller::CommissioningStage> lastCompletedStage;
+    CompletionStatus completionStatus;
+    bool hasCompletionStatus = false;
+    CommissioningProgressCallback progressCallback;
 };
+
+void AppendStage(std::wstring & message, wchar_t const * label, Optional<chip::Controller::CommissioningStage> stage)
+{
+    if (!stage.HasValue())
+    {
+        return;
+    }
+
+    chip::Controller::CommissioningStage value = stage.Value();
+    char const * name                           = StageToString(value);
+    message.append(L" ");
+    message.append(label);
+    message.append(L": ");
+    if (name != nullptr && name[0] != '\0')
+    {
+        message.append(to_hstring(name).c_str());
+        message.append(L" (");
+        message.append(std::to_wstring(static_cast<uint16_t>(value)));
+        message.append(L")");
+    }
+    else
+    {
+        message.append(std::to_wstring(static_cast<uint16_t>(value)));
+    }
+    message.append(L".");
+}
+
+std::wstring CommissioningTimeoutMessage(PairingState const & state)
+{
+    std::wstring message = L"Matter commissioning timed out.";
+    AppendStage(message, L"Active stage", state.activeStage);
+    AppendStage(message, L"Last completed stage", state.lastCompletedStage);
+    return message;
+}
+
+[[noreturn]] void ThrowCommissioningError(PairingState const & state)
+{
+    std::wstring message = L"Commission device: ";
+    message.append(to_hstring(state.error.AsString()).c_str());
+    message.append(L".");
+    AppendStage(message, L"Failed stage", state.completionStatus.failedStage);
+    AppendStage(message, L"Active stage", state.activeStage);
+    AppendStage(message, L"Last completed stage", state.lastCompletedStage);
+
+    if (state.completionStatus.commissioningError.HasValue())
+    {
+        message.append(L" Commissioning error: ");
+        message.append(std::to_wstring(static_cast<uint8_t>(state.completionStatus.commissioningError.Value())));
+        message.append(L".");
+    }
+    if (state.completionStatus.networkCommissioningStatus.HasValue())
+    {
+        message.append(L" Network commissioning status: ");
+        message.append(std::to_wstring(static_cast<uint8_t>(state.completionStatus.networkCommissioningStatus.Value())));
+        message.append(L".");
+    }
+    if (state.completionStatus.connectNetworkErrorValue.HasValue())
+    {
+        message.append(L" Connect network error: ");
+        message.append(std::to_wstring(state.completionStatus.connectNetworkErrorValue.Value()));
+        message.append(L".");
+    }
+    if (state.completionStatus.operationalCertStatus.HasValue())
+    {
+        message.append(L" Operational certificate status: ");
+        message.append(std::to_wstring(static_cast<uint8_t>(state.completionStatus.operationalCertStatus.Value())));
+        message.append(L".");
+    }
+    if (state.completionStatus.attestationResult.HasValue())
+    {
+        message.append(L" Attestation result: ");
+        message.append(std::to_wstring(static_cast<uint16_t>(state.completionStatus.attestationResult.Value())));
+        message.append(L".");
+    }
+    throw hresult_error(HRESULT_FROM_WIN32(ERROR_GEN_FAILURE), message);
+}
 
 class PairingDelegate final : public DevicePairingDelegate, public Credentials::DeviceAttestationDelegate
 {
 public:
     PairingDelegate(PairingState & state, bool allowTestAttestation) : mState(state), mAllowTestAttestation(allowTestAttestation) {}
 
-    void Reset()
+    void Reset(CommissioningProgressCallback progressCallback = {})
     {
         std::scoped_lock lock(mState.mutex);
-        mState.complete = false;
-        mState.error    = CHIP_NO_ERROR;
+        mState.complete               = false;
+        mState.error                  = CHIP_NO_ERROR;
+        mState.activeStage            = NullOptional;
+        mState.lastCompletedStage     = NullOptional;
+        mState.completionStatus       = CompletionStatus();
+        mState.hasCompletionStatus    = false;
+        mState.progressCallback       = std::move(progressCallback);
     }
 
     void OnCommissioningComplete(NodeId, CHIP_ERROR error) override
     {
+        Complete(error);
+    }
+
+    void OnCommissioningFailure(PeerId, const CompletionStatus & completionStatus) override
+    {
         {
             std::scoped_lock lock(mState.mutex);
-            mState.complete = true;
-            mState.error    = error;
+            mState.completionStatus    = completionStatus;
+            mState.hasCompletionStatus = true;
+            mState.error               = completionStatus.err;
+            mState.complete            = true;
         }
         mState.condition.notify_all();
+    }
+
+    void OnCommissioningStageStart(PeerId, chip::Controller::CommissioningStage stageStarting) override
+    {
+        CommissioningProgressCallback callback;
+        {
+            std::scoped_lock lock(mState.mutex);
+            mState.activeStage = MakeOptional(stageStarting);
+            callback           = mState.progressCallback;
+        }
+        if (callback)
+        {
+            callback({ stageStarting, CHIP_NO_ERROR, false, false });
+        }
+    }
+
+    void OnCommissioningStatusUpdate(PeerId, chip::Controller::CommissioningStage stageCompleted, CHIP_ERROR error) override
+    {
+        CommissioningProgressCallback callback;
+        {
+            std::scoped_lock lock(mState.mutex);
+            mState.lastCompletedStage = MakeOptional(stageCompleted);
+            mState.activeStage        = NullOptional;
+            callback                  = mState.progressCallback;
+        }
+        if (callback)
+        {
+            callback({ stageCompleted, error, true, false });
+        }
+    }
+
+    void OnCommissioningRetry(PeerId, chip::Controller::CommissioningStage stage, CHIP_ERROR error) override
+    {
+        CommissioningProgressCallback callback;
+        {
+            std::scoped_lock lock(mState.mutex);
+            callback = mState.progressCallback;
+        }
+        if (callback)
+        {
+            callback({ stage, error, false, true });
+        }
     }
 
     Optional<uint16_t> FailSafeExpiryTimeoutSecs() const override { return NullOptional; }
@@ -349,7 +601,7 @@ public:
     {
         if (result != Credentials::AttestationVerificationResult::kSuccess && !mAllowTestAttestation)
         {
-            OnCommissioningComplete(kUndefinedNodeId, CHIP_ERROR_CERT_NOT_TRUSTED);
+            Complete(CHIP_ERROR_CERT_NOT_TRUSTED);
             return;
         }
 
@@ -357,11 +609,21 @@ public:
             commissioner->ContinueCommissioningAfterDeviceAttestation(device, Credentials::AttestationVerificationResult::kSuccess);
         if (error != CHIP_NO_ERROR)
         {
-            OnCommissioningComplete(kUndefinedNodeId, error);
+            Complete(error);
         }
     }
 
 private:
+    void Complete(CHIP_ERROR error)
+    {
+        {
+            std::scoped_lock lock(mState.mutex);
+            mState.complete = true;
+            mState.error    = error;
+        }
+        mState.condition.notify_all();
+    }
+
     PairingState & mState;
     bool mAllowTestAttestation;
 };
@@ -649,6 +911,8 @@ public:
     void Close()
     {
         PlatformMgr().LockChipStack();
+        onConnected.Cancel();
+        onConnectionFailure.Cancel();
         client.reset();
         PlatformMgr().UnlockChipStack();
         {
@@ -708,12 +972,157 @@ private:
     Platform::UniquePtr<app::ReadClient> client;
 };
 
+class GenericEventReadState final : public app::ReadClient::Callback
+{
+public:
+    using ReportCallback = std::function<void(Controller::EventValue const &)>;
+
+    GenericEventReadState(EndpointId endpoint, ClusterId cluster, EventId event, bool urgent, EventNumber minimumEventNumber,
+                          bool subscription, uint16_t minimumInterval, uint16_t maximumInterval,
+                          ReportCallback reportCallback = {}) :
+        mPath(endpoint, cluster, event, urgent), mMinimumEventNumber(minimumEventNumber), mSubscription(subscription),
+        mMinimumInterval(minimumInterval), mMaximumInterval(maximumInterval), mReportCallback(std::move(reportCallback)),
+        onConnected(&HandleConnected, this), onConnectionFailure(&HandleConnectionFailure, this)
+    {}
+
+    void OnEventData(app::EventHeader const & header, TLV::TLVReader * data, app::StatusIB const * status) override
+    {
+        CHIP_ERROR error = status == nullptr ? CHIP_NO_ERROR : status->ToChipError();
+        if (error != CHIP_NO_ERROR || data == nullptr)
+        {
+            Fail(error != CHIP_NO_ERROR ? error : CHIP_ERROR_INVALID_ARGUMENT);
+            return;
+        }
+        try
+        {
+            auto decoded = DecodePropertySetRoot(*data);
+            auto path = winrt::make<implementation::EventPath>(header.mPath.mEndpointId, header.mPath.mClusterId,
+                                                               header.mPath.mEventId, mPath.mIsUrgentEvent);
+            auto value = winrt::make<implementation::EventValue>(path, header.mEventNumber, decoded);
+            if (!mSubscription)
+            {
+                std::scoped_lock lock(mutex);
+                values.push_back(value);
+            }
+            if (mReportCallback)
+            {
+                mReportCallback(value);
+            }
+        }
+        catch (hresult_error const &)
+        {
+            Fail(CHIP_ERROR_DECODE_FAILED);
+        }
+        condition.notify_all();
+    }
+
+    void OnError(CHIP_ERROR error) override { Fail(error); }
+
+    void OnDone(app::ReadClient *) override
+    {
+        if (!mSubscription)
+        {
+            std::scoped_lock lock(mutex);
+            complete = true;
+            condition.notify_all();
+        }
+    }
+
+    void OnSubscriptionEstablished(SubscriptionId) override
+    {
+        {
+            std::scoped_lock lock(mutex);
+            established = true;
+        }
+        condition.notify_all();
+    }
+
+    void Fail(CHIP_ERROR error)
+    {
+        {
+            std::scoped_lock lock(mutex);
+            if (closed)
+            {
+                return;
+            }
+            result   = error;
+            complete = true;
+        }
+        condition.notify_all();
+    }
+
+    void Close()
+    {
+        PlatformMgr().LockChipStack();
+        onConnected.Cancel();
+        onConnectionFailure.Cancel();
+        client.reset();
+        PlatformMgr().UnlockChipStack();
+        {
+            std::scoped_lock lock(mutex);
+            closed   = true;
+            complete = true;
+        }
+        condition.notify_all();
+    }
+
+    static void HandleConnected(void * context, Messaging::ExchangeManager & exchangeManager, SessionHandle const & session)
+    {
+        auto * state = static_cast<GenericEventReadState *>(context);
+        state->client = Platform::MakeUnique<app::ReadClient>(
+            app::InteractionModelEngine::GetInstance(), &exchangeManager, *state,
+            state->mSubscription ? app::ReadClient::InteractionType::Subscribe : app::ReadClient::InteractionType::Read);
+        if (!state->client)
+        {
+            state->Fail(CHIP_ERROR_NO_MEMORY);
+            return;
+        }
+        app::ReadPrepareParams parameters(session);
+        parameters.mpEventPathParamsList       = &state->mPath;
+        parameters.mEventPathParamsListSize    = 1;
+        parameters.mEventNumber.SetValue(state->mMinimumEventNumber);
+        parameters.mIsFabricFiltered           = true;
+        parameters.mMinIntervalFloorSeconds    = state->mMinimumInterval;
+        parameters.mMaxIntervalCeilingSeconds  = state->mMaximumInterval;
+        CHIP_ERROR error = state->client->SendRequest(parameters);
+        if (error != CHIP_NO_ERROR)
+        {
+            state->Fail(error);
+        }
+    }
+
+    static void HandleConnectionFailure(void * context, ScopedNodeId const &, CHIP_ERROR error)
+    {
+        static_cast<GenericEventReadState *>(context)->Fail(error);
+    }
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool complete = false;
+    bool established = false;
+    bool closed = false;
+    CHIP_ERROR result = CHIP_NO_ERROR;
+    std::vector<Controller::EventValue> values;
+    chip::Callback::Callback<OnDeviceConnected> onConnected;
+    chip::Callback::Callback<OnDeviceConnectionFailure> onConnectionFailure;
+
+private:
+    app::EventPathParams mPath;
+    EventNumber mMinimumEventNumber;
+    bool mSubscription;
+    uint16_t mMinimumInterval;
+    uint16_t mMaximumInterval;
+    ReportCallback mReportCallback;
+    Platform::UniquePtr<app::ReadClient> client;
+};
+
 class GenericWriteState final : public app::WriteClient::Callback
 {
 public:
-    GenericWriteState(EndpointId endpoint, ClusterId cluster, AttributeId attribute, std::vector<uint8_t> encoded) :
-        mPath(endpoint, cluster, attribute), mEncoded(std::move(encoded)), onConnected(&HandleConnected, this),
-        onConnectionFailure(&HandleConnectionFailure, this)
+    GenericWriteState(EndpointId endpoint, ClusterId cluster, AttributeId attribute, std::vector<uint8_t> encoded,
+                      std::optional<uint16_t> timedWriteTimeout) :
+        mPath(endpoint, cluster, attribute), mEncoded(std::move(encoded)), mTimedWriteTimeout(timedWriteTimeout),
+        onConnected(&HandleConnected, this), onConnectionFailure(&HandleConnectionFailure, this)
     {}
 
     void OnResponse(app::WriteClient const *, app::ConcreteDataAttributePath const &, app::StatusIB status) override
@@ -739,7 +1148,12 @@ public:
     static void HandleConnected(void * context, Messaging::ExchangeManager & exchangeManager, SessionHandle const & session)
     {
         auto * state = static_cast<GenericWriteState *>(context);
-        state->client = Platform::MakeUnique<app::WriteClient>(&exchangeManager, state, NullOptional);
+        Optional<uint16_t> timedWriteTimeout;
+        if (state->mTimedWriteTimeout.has_value())
+        {
+            timedWriteTimeout.SetValue(*state->mTimedWriteTimeout);
+        }
+        state->client = Platform::MakeUnique<app::WriteClient>(&exchangeManager, state, timedWriteTimeout);
         if (!state->client)
         {
             state->Finish(CHIP_ERROR_NO_MEMORY);
@@ -780,6 +1194,8 @@ public:
     void ReleaseClient()
     {
         PlatformMgr().LockChipStack();
+        onConnected.Cancel();
+        onConnectionFailure.Cancel();
         client.reset();
         PlatformMgr().UnlockChipStack();
     }
@@ -794,15 +1210,18 @@ public:
 private:
     app::ConcreteDataAttributePath mPath;
     std::vector<uint8_t> mEncoded;
+    std::optional<uint16_t> mTimedWriteTimeout;
     Platform::UniquePtr<app::WriteClient> client;
 };
 
 class GenericInvokeState final : public app::CommandSender::Callback
 {
 public:
-    GenericInvokeState(EndpointId endpoint, ClusterId cluster, CommandId command, std::vector<uint8_t> encoded) :
+    GenericInvokeState(EndpointId endpoint, ClusterId cluster, CommandId command, std::vector<uint8_t> encoded,
+                       std::optional<uint16_t> timedInvokeTimeout) :
         mPath(endpoint, cluster, command, app::CommandPathFlags::kEndpointIdValid), mEncoded(std::move(encoded)),
-        onConnected(&HandleConnected, this), onConnectionFailure(&HandleConnectionFailure, this)
+        mTimedInvokeTimeout(timedInvokeTimeout), onConnected(&HandleConnected, this),
+        onConnectionFailure(&HandleConnectionFailure, this)
     {}
 
     void OnResponse(app::CommandSender *, app::ConcreteCommandPath const &, app::StatusIB const & status,
@@ -845,7 +1264,8 @@ public:
     static void HandleConnected(void * context, Messaging::ExchangeManager & exchangeManager, SessionHandle const & session)
     {
         auto * state = static_cast<GenericInvokeState *>(context);
-        state->sender = Platform::MakeUnique<app::CommandSender>(state, &exchangeManager, false);
+        state->sender =
+            Platform::MakeUnique<app::CommandSender>(state, &exchangeManager, state->mTimedInvokeTimeout.has_value());
         if (!state->sender)
         {
             state->Finish(CHIP_ERROR_NO_MEMORY);
@@ -870,7 +1290,12 @@ public:
         }
         if (error == CHIP_NO_ERROR)
         {
-            app::CommandSender::FinishCommandParameters finishParameters;
+            Optional<uint16_t> timedInvokeTimeout;
+            if (state->mTimedInvokeTimeout.has_value())
+            {
+                timedInvokeTimeout.SetValue(*state->mTimedInvokeTimeout);
+            }
+            app::CommandSender::FinishCommandParameters finishParameters(timedInvokeTimeout);
             error = state->sender->FinishCommand(finishParameters);
         }
         if (error == CHIP_NO_ERROR)
@@ -901,6 +1326,8 @@ public:
     void ReleaseSender()
     {
         PlatformMgr().LockChipStack();
+        onConnected.Cancel();
+        onConnectionFailure.Cancel();
         sender.reset();
         PlatformMgr().UnlockChipStack();
     }
@@ -916,6 +1343,7 @@ public:
 private:
     app::CommandPathParams mPath;
     std::vector<uint8_t> mEncoded;
+    std::optional<uint16_t> mTimedInvokeTimeout;
     Platform::UniquePtr<app::CommandSender> sender;
 };
 
@@ -932,7 +1360,7 @@ std::string GenerateSetupCode(uint32_t pinCode, uint16_t discriminator)
 
 } // namespace
 
-class ControllerRuntime
+class ControllerRuntime : public std::enable_shared_from_this<ControllerRuntime>
 {
 public:
     static std::shared_ptr<ControllerRuntime> Create(Controller::ControllerOptions const & options)
@@ -956,20 +1384,23 @@ public:
 
     void Close()
     {
+        std::scoped_lock operationLock(mOperationMutex);
         std::scoped_lock lock(mMutex);
         if (mClosed)
         {
             return;
         }
 
-        for (auto const & weakSubscription : mSubscriptions)
+        for (auto const & subscription : mSubscriptions)
         {
-            if (auto subscription = weakSubscription.lock())
-            {
-                subscription->Close();
-            }
+            subscription->Close();
         }
         mSubscriptions.clear();
+        for (auto const & subscription : mEventSubscriptions)
+        {
+            subscription->Close();
+        }
+        mEventSubscriptions.clear();
         (void) PlatformMgr().StopEventLoopTask();
         PlatformMgr().LockChipStack();
         if (mCommissionerInitialized)
@@ -991,31 +1422,68 @@ public:
         mClosed = true;
     }
 
-    uint16_t FabricIndex() const { return mCommissioner.GetFabricIndex(); }
-
-    Controller::CommissionedNode Commission(uint64_t nodeId, uint32_t pinCode, uint16_t discriminator, bool useBle,
-                                            std::string const & providedSetupCode = {})
+    uint16_t FabricIndex()
     {
         std::scoped_lock operationLock(mOperationMutex);
-        mPairingDelegate.Reset();
+        EnsureOpen();
+        return mCommissioner.GetFabricIndex();
+    }
+
+    Controller::CommissionedNode Commission(uint64_t nodeId, uint32_t pinCode, uint16_t discriminator, bool useBle,
+                                            std::string const & providedSetupCode = {},
+                                            std::optional<WiFiCredentials> const & wiFiCredentials = std::nullopt,
+                                            ByteSpan threadOperationalDataset = {},
+                                            Optional<AddressResolve::InterfaceSelection> interfaceSelection = NullOptional,
+                                            CommissioningProgressCallback progressCallback = {},
+                                            std::shared_ptr<std::atomic_bool> cancellationRequested = {})
+    {
+        std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
+        mPairingDelegate.Reset(std::move(progressCallback));
         std::string setupCode = providedSetupCode.empty() ? GenerateSetupCode(pinCode, discriminator) : providedSetupCode;
 
         CommissioningParameters parameters;
         parameters.SetDeviceAttestationDelegate(&mPairingDelegate);
+        if (wiFiCredentials.has_value())
+        {
+            parameters.SetWiFiCredentials(*wiFiCredentials);
+        }
+        if (!threadOperationalDataset.empty())
+        {
+            parameters.SetThreadOperationalDataset(threadOperationalDataset);
+        }
+        if (interfaceSelection.HasValue())
+        {
+            parameters.SetOperationalInterfaceSelection(interfaceSelection.Value());
+        }
         PlatformMgr().LockChipStack();
         CHIP_ERROR error = mCommissioner.PairDevice(
             nodeId, setupCode.c_str(), parameters, useBle ? DiscoveryType::kDiscoveryBleOnly : DiscoveryType::kDiscoveryNetworkOnly);
         PlatformMgr().UnlockChipStack();
         CheckChipError(error, L"Start commissioning");
+        if (cancellationRequested && cancellationRequested->load(std::memory_order_acquire))
+        {
+            CancelCommission(nodeId);
+        }
 
         std::unique_lock lock(mPairingState.mutex);
         if (!mPairingState.condition.wait_for(lock, kCommissioningTimeout, [this]() { return mPairingState.complete; }))
         {
+            std::wstring timeoutMessage = CommissioningTimeoutMessage(mPairingState);
             lock.unlock();
             PlatformMgr().LockChipStack();
             (void) mCommissioner.StopPairing(nodeId);
             PlatformMgr().UnlockChipStack();
-            throw hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"Matter commissioning timed out.");
+            throw hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), timeoutMessage);
+        }
+        if (mPairingState.error != CHIP_NO_ERROR && !mPairingState.hasCompletionStatus)
+        {
+            (void) mPairingState.condition.wait_for(lock, kCommissioningFailureDetailTimeout,
+                                                    [this]() { return mPairingState.hasCompletionStatus; });
+        }
+        if (mPairingState.error != CHIP_NO_ERROR && mPairingState.hasCompletionStatus)
+        {
+            ThrowCommissioningError(mPairingState);
         }
         CheckChipError(mPairingState.error, L"Commission device");
         if (std::find(mCommissionedNodes.begin(), mCommissionedNodes.end(), nodeId) == mCommissionedNodes.end())
@@ -1023,18 +1491,47 @@ public:
             mCommissionedNodes.push_back(nodeId);
             PersistCommissionedNodes();
         }
-        return winrt::make<implementation::CommissionedNode>(nodeId, FabricIndex());
+        return winrt::make<implementation::CommissionedNode>(nodeId, mCommissioner.GetFabricIndex());
+    }
+
+    void CancelCommission(uint64_t nodeId)
+    {
+        PlatformMgr().LockChipStack();
+        (void) mCommissioner.StopPairing(nodeId);
+        PlatformMgr().UnlockChipStack();
     }
 
     std::vector<uint64_t> CommissionedNodes()
     {
         std::scoped_lock lock(mOperationMutex);
+        EnsureOpen();
         return mCommissionedNodes;
+    }
+
+    Controller::CommissionedNode RecoverNode(uint64_t nodeId)
+    {
+        if (!IsOperationalNodeId(nodeId))
+        {
+            throw hresult_invalid_argument(L"nodeId must be an operational Matter node identifier.");
+        }
+
+        (void) ReadAttribute(nodeId, 0, app::Clusters::BasicInformation::Id,
+                             app::Clusters::BasicInformation::Attributes::VendorID::Id);
+
+        std::scoped_lock lock(mOperationMutex);
+        EnsureOpen();
+        if (std::find(mCommissionedNodes.begin(), mCommissionedNodes.end(), nodeId) == mCommissionedNodes.end())
+        {
+            mCommissionedNodes.push_back(nodeId);
+            PersistCommissionedNodes();
+        }
+        return winrt::make<implementation::CommissionedNode>(nodeId, mCommissioner.GetFabricIndex());
     }
 
     void RemoveNode(uint64_t nodeId)
     {
         std::scoped_lock lock(mOperationMutex);
+        EnsureOpen();
         PlatformMgr().LockChipStack();
         CHIP_ERROR error = mCommissioner.UnpairDevice(nodeId);
         PlatformMgr().UnlockChipStack();
@@ -1077,6 +1574,7 @@ public:
     void Invoke(uint64_t nodeId, uint16_t endpointId, Request request)
     {
         std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
         CommandOperationState<Request> state(endpointId, std::move(request));
         PlatformMgr().LockChipStack();
         CHIP_ERROR error = mCommissioner.GetConnectedDevice(nodeId, &state.onConnected, &state.onConnectionFailure);
@@ -1096,6 +1594,7 @@ public:
                typename ReadOperationState<AttributeType, Value>::Converter converter)
     {
         std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
         ReadOperationState<AttributeType, Value> state(endpointId, std::move(converter));
         PlatformMgr().LockChipStack();
         CHIP_ERROR error = mCommissioner.GetConnectedDevice(nodeId, &state.onConnected, &state.onConnectionFailure);
@@ -1115,6 +1614,7 @@ public:
                                                                   AttributeId attributeId)
     {
         std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
         auto state = std::make_shared<GenericReadState>(endpointId, clusterId, attributeId, false, 0, 0);
         StartConnectedOperation(nodeId, state->onConnected, state->onConnectionFailure);
         std::unique_lock lock(state->mutex);
@@ -1137,15 +1637,17 @@ public:
     }
 
     void WriteAttribute(uint64_t nodeId, EndpointId endpointId, ClusterId clusterId, AttributeId attributeId,
-                        Windows::Foundation::Collections::IPropertySet const & value)
+                        Windows::Foundation::Collections::IPropertySet const & value,
+                        std::optional<uint16_t> timedWriteTimeout = std::nullopt)
     {
         std::vector<uint8_t> encoded;
         CheckChipError(EncodePropertySetRoot(value, encoded), L"Encode Matter attribute value");
         std::scoped_lock operationLock(mOperationMutex);
-        GenericWriteState state(endpointId, clusterId, attributeId, std::move(encoded));
+        EnsureOpen();
+        GenericWriteState state(endpointId, clusterId, attributeId, std::move(encoded), timedWriteTimeout);
         StartConnectedOperation(nodeId, state.onConnected, state.onConnectionFailure);
         std::unique_lock lock(state.mutex);
-        if (!state.condition.wait_for(lock, kInteractionTimeout, [&state]() { return state.complete; }))
+        if (!state.condition.wait_for(lock, InteractionWaitTimeout(timedWriteTimeout), [&state]() { return state.complete; }))
         {
             lock.unlock();
             state.ReleaseClient();
@@ -1159,15 +1661,17 @@ public:
 
     Windows::Foundation::Collections::IPropertySet InvokeCommand(uint64_t nodeId, EndpointId endpointId, ClusterId clusterId,
                                                                   CommandId commandId,
-                                                                  Windows::Foundation::Collections::IPropertySet const & arguments)
+                                                                  Windows::Foundation::Collections::IPropertySet const & arguments,
+                                                                  std::optional<uint16_t> timedInvokeTimeout = std::nullopt)
     {
         std::vector<uint8_t> encoded;
         CheckChipError(EncodePropertySetRoot(arguments, encoded), L"Encode Matter command arguments");
         std::scoped_lock operationLock(mOperationMutex);
-        GenericInvokeState state(endpointId, clusterId, commandId, std::move(encoded));
+        EnsureOpen();
+        GenericInvokeState state(endpointId, clusterId, commandId, std::move(encoded), timedInvokeTimeout);
         StartConnectedOperation(nodeId, state.onConnected, state.onConnectionFailure);
         std::unique_lock lock(state.mutex);
-        if (!state.condition.wait_for(lock, kInteractionTimeout, [&state]() { return state.complete; }))
+        if (!state.condition.wait_for(lock, InteractionWaitTimeout(timedInvokeTimeout), [&state]() { return state.complete; }))
         {
             lock.unlock();
             state.ReleaseSender();
@@ -1190,6 +1694,7 @@ public:
             throw hresult_invalid_argument(L"The minimum subscription interval cannot exceed the maximum interval.");
         }
         std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
         auto projectedWeak = std::make_shared<winrt::weak_ref<Controller::AttributeSubscription>>();
         auto state         = std::make_shared<GenericReadState>(
             endpointId, clusterId, attributeId, true, minimumInterval, maximumInterval,
@@ -1204,7 +1709,17 @@ public:
                     winrt::get_self<implementation::AttributeSubscription>(subscription)->Publish(args);
                 }
             });
-        auto subscription = winrt::make<implementation::AttributeSubscription>([state]() { state->Close(); });
+        auto runtimeWeak  = weak_from_this();
+        auto subscription = winrt::make<implementation::AttributeSubscription>([runtimeWeak, state]() {
+            if (auto runtime = runtimeWeak.lock())
+            {
+                runtime->CloseAttributeSubscription(state);
+            }
+            else
+            {
+                state->Close();
+            }
+        });
         *projectedWeak     = winrt::make_weak(subscription);
         StartConnectedOperation(nodeId, state->onConnected, state->onConnectionFailure);
 
@@ -1219,6 +1734,10 @@ public:
         CHIP_ERROR result = state->result;
         bool established  = state->established;
         lock.unlock();
+        if (result != CHIP_NO_ERROR)
+        {
+            state->Close();
+        }
         CheckChipError(result, L"Subscribe to Matter attribute");
         if (!established)
         {
@@ -1229,7 +1748,112 @@ public:
         return subscription;
     }
 
+    std::vector<Controller::EventValue> ReadEvents(uint64_t nodeId, EndpointId endpointId, ClusterId clusterId, EventId eventId,
+                                                   bool urgent, EventNumber minimumEventNumber)
+    {
+        std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
+        auto state = std::make_shared<GenericEventReadState>(endpointId, clusterId, eventId, urgent, minimumEventNumber, false, 0, 0);
+        StartConnectedOperation(nodeId, state->onConnected, state->onConnectionFailure);
+        std::unique_lock lock(state->mutex);
+        if (!state->condition.wait_for(lock, kInteractionTimeout, [&state]() { return state->complete; }))
+        {
+            lock.unlock();
+            state->Close();
+            throw hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"Matter event read timed out.");
+        }
+        CHIP_ERROR result = state->result;
+        auto values       = std::move(state->values);
+        lock.unlock();
+        state->Close();
+        CheckChipError(result, L"Read Matter events");
+        return values;
+    }
+
+    Controller::EventSubscription SubscribeEvent(uint64_t nodeId, EndpointId endpointId, ClusterId clusterId, EventId eventId,
+                                                 bool urgent, EventNumber minimumEventNumber, uint16_t minimumInterval,
+                                                 uint16_t maximumInterval)
+    {
+        if (minimumInterval > maximumInterval)
+        {
+            throw hresult_invalid_argument(L"The minimum subscription interval cannot exceed the maximum interval.");
+        }
+        std::scoped_lock operationLock(mOperationMutex);
+        EnsureOpen();
+        auto projectedWeak = std::make_shared<winrt::weak_ref<Controller::EventSubscription>>();
+        auto state = std::make_shared<GenericEventReadState>(
+            endpointId, clusterId, eventId, urgent, minimumEventNumber, true, minimumInterval, maximumInterval,
+            [projectedWeak](Controller::EventValue const & value) {
+                if (auto subscription = projectedWeak->get())
+                {
+                    auto args = winrt::make<implementation::EventReportEventArgs>(value);
+                    winrt::get_self<implementation::EventSubscription>(subscription)->Publish(args);
+                }
+            });
+        auto runtimeWeak  = weak_from_this();
+        auto subscription = winrt::make<implementation::EventSubscription>([runtimeWeak, state]() {
+            if (auto runtime = runtimeWeak.lock())
+            {
+                runtime->CloseEventSubscription(state);
+            }
+            else
+            {
+                state->Close();
+            }
+        });
+        *projectedWeak     = winrt::make_weak(subscription);
+        StartConnectedOperation(nodeId, state->onConnected, state->onConnectionFailure);
+
+        std::unique_lock lock(state->mutex);
+        if (!state->condition.wait_for(lock, kInteractionTimeout,
+                                       [&state]() { return state->established || state->complete; }))
+        {
+            lock.unlock();
+            state->Close();
+            throw hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT), L"Matter event subscription timed out.");
+        }
+        CHIP_ERROR result = state->result;
+        bool established  = state->established;
+        lock.unlock();
+        if (result != CHIP_NO_ERROR)
+        {
+            state->Close();
+        }
+        CheckChipError(result, L"Subscribe to Matter event");
+        if (!established)
+        {
+            state->Close();
+            throw hresult_error(E_FAIL, L"The Matter event subscription ended before it was established.");
+        }
+        mEventSubscriptions.push_back(state);
+        return subscription;
+    }
+
 private:
+    void EnsureOpen()
+    {
+        std::scoped_lock lock(mMutex);
+        if (mClosed)
+        {
+            throw hresult_illegal_method_call(L"The Matter controller is closed.");
+        }
+    }
+
+    void CloseAttributeSubscription(std::shared_ptr<GenericReadState> const & state)
+    {
+        std::scoped_lock operationLock(mOperationMutex);
+        state->Close();
+        mSubscriptions.erase(std::remove(mSubscriptions.begin(), mSubscriptions.end(), state), mSubscriptions.end());
+    }
+
+    void CloseEventSubscription(std::shared_ptr<GenericEventReadState> const & state)
+    {
+        std::scoped_lock operationLock(mOperationMutex);
+        state->Close();
+        mEventSubscriptions.erase(std::remove(mEventSubscriptions.begin(), mEventSubscriptions.end(), state),
+                                  mEventSubscriptions.end());
+    }
+
     explicit ControllerRuntime(Controller::ControllerOptions const & options) :
         mStoragePath(options.StoragePath()), mControllerNodeId(options.ControllerNodeId()),
         mBluetoothAdapterId(options.BluetoothAdapterId()), mAllowTestAttestation(options.AllowTestAttestation()),
@@ -1354,20 +1978,34 @@ private:
 
     void LoadCommissionedNodes()
     {
-        uint16_t size = 0;
-        CHIP_ERROR error = mStorage.SyncGetKeyValue(kCommissionedNodesKey, nullptr, size);
-        if (error == CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND)
+        constexpr size_t kMaximumNodeCount = UINT16_MAX / sizeof(uint64_t);
+        std::vector<uint64_t> nodes(1);
+        while (true)
         {
+            uint16_t size = static_cast<uint16_t>(nodes.size() * sizeof(uint64_t));
+            CHIP_ERROR error = mStorage.SyncGetKeyValue(kCommissionedNodesKey, nodes.data(), size);
+            if (error == CHIP_ERROR_PERSISTED_STORAGE_VALUE_NOT_FOUND)
+            {
+                return;
+            }
+            if (error == CHIP_ERROR_BUFFER_TOO_SMALL)
+            {
+                if (nodes.size() == kMaximumNodeCount)
+                {
+                    throw hresult_error(E_BOUNDS, L"The commissioned node index is too large.");
+                }
+                nodes.resize(std::min(nodes.size() * 2, kMaximumNodeCount));
+                continue;
+            }
+            CheckChipError(error, L"Read commissioned node index");
+            if (size == 0 || size % sizeof(uint64_t) != 0)
+            {
+                throw hresult_error(E_UNEXPECTED, L"The commissioned node index is invalid.");
+            }
+            nodes.resize(size / sizeof(uint64_t));
+            mCommissionedNodes = std::move(nodes);
             return;
         }
-        CheckChipError(error == CHIP_ERROR_BUFFER_TOO_SMALL ? CHIP_NO_ERROR : error, L"Read commissioned node index");
-        if (size == 0 || size % sizeof(uint64_t) != 0)
-        {
-            return;
-        }
-        mCommissionedNodes.resize(size / sizeof(uint64_t));
-        CheckChipError(mStorage.SyncGetKeyValue(kCommissionedNodesKey, mCommissionedNodes.data(), size),
-                       L"Read commissioned node index");
     }
 
     void PersistCommissionedNodes()
@@ -1413,7 +2051,8 @@ private:
     bool mFactoryInitialized = false;
     bool mCommissionerInitialized = false;
     std::vector<uint64_t> mCommissionedNodes;
-    std::vector<std::weak_ptr<GenericReadState>> mSubscriptions;
+    std::vector<std::shared_ptr<GenericReadState>> mSubscriptions;
+    std::vector<std::shared_ptr<GenericEventReadState>> mEventSubscriptions;
 };
 
 std::mutex ControllerRuntime::sMutex;
@@ -1539,6 +2178,146 @@ void BleCommissioningParameters::LongDiscriminator(uint16_t value)
     mLongDiscriminator = value;
 }
 
+WiFiNetworkCredentials::WiFiNetworkCredentials(hstring const & ssid, hstring const & passphrase)
+{
+    std::vector<uint8_t> encodedSsid       = Utf8Bytes(ssid);
+    std::vector<uint8_t> encodedPassphrase = Utf8Bytes(passphrase);
+    if (encodedSsid.empty() || encodedSsid.size() > CommissioningParameters::kMaxSsidLen ||
+        encodedPassphrase.size() > CommissioningParameters::kMaxCredentialsLen)
+    {
+        Crypto::ClearSecretData(encodedSsid.data(), encodedSsid.size());
+        Crypto::ClearSecretData(encodedPassphrase.data(), encodedPassphrase.size());
+        throw hresult_invalid_argument(
+            L"ssid must contain 1 to 32 UTF-8 bytes and passphrase must not exceed 64 UTF-8 bytes.");
+    }
+    mSsid       = std::move(encodedSsid);
+    mPassphrase = std::move(encodedPassphrase);
+}
+
+WiFiNetworkCredentials::~WiFiNetworkCredentials()
+{
+    if (!mSsid.empty())
+    {
+        Crypto::ClearSecretData(mSsid.data(), mSsid.size());
+    }
+    if (!mPassphrase.empty())
+    {
+        Crypto::ClearSecretData(mPassphrase.data(), mPassphrase.size());
+    }
+}
+
+uint32_t WiFiNetworkCredentials::SsidLength() const
+{
+    return static_cast<uint32_t>(mSsid.size());
+}
+
+uint32_t WiFiNetworkCredentials::PassphraseLength() const
+{
+    return static_cast<uint32_t>(mPassphrase.size());
+}
+
+std::vector<uint8_t> const & WiFiNetworkCredentials::Ssid() const
+{
+    return mSsid;
+}
+
+std::vector<uint8_t> const & WiFiNetworkCredentials::Passphrase() const
+{
+    return mPassphrase;
+}
+
+ThreadNetworkCredentials::ThreadNetworkCredentials(Windows::Storage::Streams::IBuffer const & operationalDataset)
+{
+    if (!operationalDataset)
+    {
+        throw hresult_invalid_argument(L"operationalDataset cannot be null.");
+    }
+    if (operationalDataset.Length() == 0 ||
+        operationalDataset.Length() > CommissioningParameters::kMaxThreadDatasetLen)
+    {
+        throw hresult_invalid_argument(L"operationalDataset must contain between 1 and 254 bytes.");
+    }
+    std::vector<uint8_t> dataset(operationalDataset.Length());
+    try
+    {
+        Windows::Storage::Streams::DataReader::FromBuffer(operationalDataset).ReadBytes(dataset);
+    }
+    catch (...)
+    {
+        Crypto::ClearSecretData(dataset.data(), dataset.size());
+        throw;
+    }
+    mOperationalDataset = std::move(dataset);
+}
+
+ThreadNetworkCredentials::~ThreadNetworkCredentials()
+{
+    if (!mOperationalDataset.empty())
+    {
+        Crypto::ClearSecretData(mOperationalDataset.data(), mOperationalDataset.size());
+    }
+}
+
+uint32_t ThreadNetworkCredentials::DatasetLength() const
+{
+    return static_cast<uint32_t>(mOperationalDataset.size());
+}
+
+std::vector<uint8_t> const & ThreadNetworkCredentials::OperationalDataset() const
+{
+    return mOperationalDataset;
+}
+
+uint64_t BleNetworkCommissioningParameters::NodeId() const
+{
+    return mNodeId;
+}
+
+void BleNetworkCommissioningParameters::NodeId(uint64_t value)
+{
+    mNodeId = value;
+}
+
+uint32_t BleNetworkCommissioningParameters::SetupPinCode() const
+{
+    return mSetupPinCode;
+}
+
+void BleNetworkCommissioningParameters::SetupPinCode(uint32_t value)
+{
+    mSetupPinCode = value;
+}
+
+uint16_t BleNetworkCommissioningParameters::LongDiscriminator() const
+{
+    return mLongDiscriminator;
+}
+
+void BleNetworkCommissioningParameters::LongDiscriminator(uint16_t value)
+{
+    mLongDiscriminator = value;
+}
+
+Controller::WiFiNetworkCredentials BleNetworkCommissioningParameters::WiFi() const
+{
+    return mWiFi;
+}
+
+void BleNetworkCommissioningParameters::WiFi(Controller::WiFiNetworkCredentials const & value)
+{
+    mWiFi = value;
+}
+
+Controller::ThreadNetworkCredentials BleNetworkCommissioningParameters::Thread() const
+{
+    return mThread;
+}
+
+void BleNetworkCommissioningParameters::Thread(Controller::ThreadNetworkCredentials const & value)
+{
+    mThread = value;
+}
+
 AttributePath::AttributePath(uint16_t endpointId, uint32_t clusterId, uint32_t attributeId) :
     mEndpointId(endpointId), mClusterId(clusterId), mAttributeId(attributeId)
 {}
@@ -1577,6 +2356,30 @@ uint32_t CommandPath::CommandId() const
     return mCommandId;
 }
 
+EventPath::EventPath(uint16_t endpointId, uint32_t clusterId, uint32_t eventId, bool urgent) :
+    mEndpointId(endpointId), mClusterId(clusterId), mEventId(eventId), mUrgent(urgent)
+{}
+
+uint16_t EventPath::EndpointId() const
+{
+    return mEndpointId;
+}
+
+uint32_t EventPath::ClusterId() const
+{
+    return mClusterId;
+}
+
+uint32_t EventPath::EventId() const
+{
+    return mEventId;
+}
+
+bool EventPath::Urgent() const
+{
+    return mUrgent;
+}
+
 CommissionedNode::CommissionedNode(uint64_t nodeId, uint16_t fabricIndex) : mNodeId(nodeId), mFabricIndex(fabricIndex) {}
 
 uint64_t CommissionedNode::NodeId() const
@@ -1602,6 +2405,89 @@ hstring CommissioningProgressEventArgs::Message() const
 {
     return mMessage;
 }
+
+MatterNetworkInterfaceSelection::MatterNetworkInterfaceSelection(Controller::MatterNetworkInterfaceSelectionMode mode,
+                                                                 uint64_t interfaceId) :
+    mMode(mode),
+    mInterfaceId(interfaceId)
+{
+    if ((mode == Controller::MatterNetworkInterfaceSelectionMode::Automatic) != (interfaceId == 0))
+    {
+        throw hresult_invalid_argument(L"Automatic selection requires interface ID 0; explicit selection requires a nonzero ID.");
+    }
+}
+
+Controller::MatterNetworkInterfaceSelectionMode MatterNetworkInterfaceSelection::Mode() const
+{
+    return mMode;
+}
+
+uint64_t MatterNetworkInterfaceSelection::InterfaceId() const
+{
+    return mInterfaceId;
+}
+
+MatterNetworkInterface::MatterNetworkInterface(uint64_t id, uint32_t index, hstring name,
+                                               Controller::MatterNetworkInterfaceType type, bool connected,
+                                               bool supportsIpv6, bool supportsMulticast, bool isVirtual) :
+    mId(id),
+    mIndex(index), mName(std::move(name)), mType(type), mConnected(connected), mSupportsIpv6(supportsIpv6),
+    mSupportsMulticast(supportsMulticast), mIsVirtual(isVirtual)
+{}
+
+uint64_t MatterNetworkInterface::Id() const { return mId; }
+uint32_t MatterNetworkInterface::InterfaceIndex() const { return mIndex; }
+hstring MatterNetworkInterface::Name() const { return mName; }
+Controller::MatterNetworkInterfaceType MatterNetworkInterface::Type() const { return mType; }
+bool MatterNetworkInterface::IsConnected() const { return mConnected; }
+bool MatterNetworkInterface::SupportsIpv6() const { return mSupportsIpv6; }
+bool MatterNetworkInterface::SupportsMulticast() const { return mSupportsMulticast; }
+bool MatterNetworkInterface::IsVirtual() const { return mIsVirtual; }
+
+MatterCommissioningProgress::MatterCommissioningProgress(
+    Controller::MatterCommissioningStage stage, Controller::MatterCommissioningStage lastCompletedStage, int32_t nativeStageId,
+    Controller::MatterCommissioningTransport transport, Windows::Foundation::TimeSpan elapsedTime, hstring diagnosticMessage,
+    hstring displayMessage, uint64_t networkInterfaceId, hstring networkInterfaceName, uint32_t attemptNumber, bool isRetrying) :
+    mStage(stage),
+    mLastCompletedStage(lastCompletedStage), mNativeStageId(nativeStageId), mTransport(transport), mElapsedTime(elapsedTime),
+    mDiagnosticMessage(std::move(diagnosticMessage)), mDisplayMessage(std::move(displayMessage)),
+    mNetworkInterfaceId(networkInterfaceId), mNetworkInterfaceName(std::move(networkInterfaceName)),
+    mAttemptNumber(attemptNumber), mIsRetrying(isRetrying)
+{}
+
+Controller::MatterCommissioningStage MatterCommissioningProgress::Stage() const { return mStage; }
+Controller::MatterCommissioningStage MatterCommissioningProgress::LastCompletedStage() const { return mLastCompletedStage; }
+int32_t MatterCommissioningProgress::NativeStageId() const { return mNativeStageId; }
+Controller::MatterCommissioningTransport MatterCommissioningProgress::Transport() const { return mTransport; }
+Windows::Foundation::TimeSpan MatterCommissioningProgress::ElapsedTime() const { return mElapsedTime; }
+hstring MatterCommissioningProgress::DiagnosticMessage() const { return mDiagnosticMessage; }
+hstring MatterCommissioningProgress::DisplayMessage() const { return mDisplayMessage; }
+uint64_t MatterCommissioningProgress::NetworkInterfaceId() const { return mNetworkInterfaceId; }
+hstring MatterCommissioningProgress::NetworkInterfaceName() const { return mNetworkInterfaceName; }
+uint32_t MatterCommissioningProgress::AttemptNumber() const { return mAttemptNumber; }
+bool MatterCommissioningProgress::IsRetrying() const { return mIsRetrying; }
+
+MatterCommissioningResult::MatterCommissioningResult(
+    bool succeeded, Controller::MatterCommissioningOutcome outcome, Controller::MatterCommissioningFailureKind failureKind,
+    Controller::MatterCommissioningStage failedStage, Controller::MatterCommissioningStage lastCompletedStage,
+    int32_t nativeStageId, int32_t nativeErrorCode, hstring diagnosticMessage, uint64_t networkInterfaceId,
+    Controller::CommissionedNode node) :
+    mSucceeded(succeeded),
+    mOutcome(outcome), mFailureKind(failureKind), mFailedStage(failedStage), mLastCompletedStage(lastCompletedStage),
+    mNativeStageId(nativeStageId), mNativeErrorCode(nativeErrorCode), mDiagnosticMessage(std::move(diagnosticMessage)),
+    mNetworkInterfaceId(networkInterfaceId), mNode(std::move(node))
+{}
+
+bool MatterCommissioningResult::Succeeded() const { return mSucceeded; }
+Controller::MatterCommissioningOutcome MatterCommissioningResult::Outcome() const { return mOutcome; }
+Controller::MatterCommissioningFailureKind MatterCommissioningResult::FailureKind() const { return mFailureKind; }
+Controller::MatterCommissioningStage MatterCommissioningResult::FailedStage() const { return mFailedStage; }
+Controller::MatterCommissioningStage MatterCommissioningResult::LastCompletedStage() const { return mLastCompletedStage; }
+int32_t MatterCommissioningResult::NativeStageId() const { return mNativeStageId; }
+int32_t MatterCommissioningResult::NativeErrorCode() const { return mNativeErrorCode; }
+hstring MatterCommissioningResult::DiagnosticMessage() const { return mDiagnosticMessage; }
+uint64_t MatterCommissioningResult::NetworkInterfaceId() const { return mNetworkInterfaceId; }
+Controller::CommissionedNode MatterCommissioningResult::Node() const { return mNode; }
 
 AttributeValue::AttributeValue(Controller::AttributePath path, Windows::Foundation::Collections::IPropertySet data) :
     mPath(std::move(path)), mData(std::move(data))
@@ -1631,6 +2517,142 @@ Windows::Foundation::Collections::IPropertySet CommandResult::Data() const
     return mData;
 }
 
+TimedInteractionOptions::TimedInteractionOptions(uint16_t timeoutMilliseconds) :
+    mTimeoutMilliseconds(timeoutMilliseconds)
+{
+    if (timeoutMilliseconds == 0)
+    {
+        throw hresult_invalid_argument(L"The timed interaction timeout must be greater than zero.");
+    }
+}
+
+uint16_t TimedInteractionOptions::TimeoutMilliseconds() const
+{
+    return mTimeoutMilliseconds;
+}
+
+EventValue::EventValue(Controller::EventPath path, uint64_t eventNumber,
+                       Windows::Foundation::Collections::IPropertySet data) :
+    mPath(std::move(path)), mEventNumber(eventNumber), mData(std::move(data))
+{}
+
+Controller::EventPath EventValue::Path() const
+{
+    return mPath;
+}
+
+uint64_t EventValue::EventNumber() const
+{
+    return mEventNumber;
+}
+
+Windows::Foundation::Collections::IPropertySet EventValue::Data() const
+{
+    return mData;
+}
+
+EventReportEventArgs::EventReportEventArgs(Controller::EventValue value) : mValue(std::move(value)) {}
+
+Controller::EventValue EventReportEventArgs::Value() const
+{
+    return mValue;
+}
+
+EventSubscription::EventSubscription(std::function<void()> close) : mClose(std::move(close)) {}
+
+event_token EventSubscription::ReportReceived(
+    Windows::Foundation::TypedEventHandler<Controller::EventSubscription, Controller::EventReportEventArgs> const & handler)
+{
+    std::vector<Controller::EventReportEventArgs> pendingReports;
+    std::exception_ptr handlerError;
+    event_token token;
+    {
+        std::scoped_lock lock(mReportMutex);
+        token = mReportReceived.add(handler);
+        ++mReportHandlerCount;
+        if (mReportHandlerCount > 1)
+        {
+            return token;
+        }
+        mDrainingPendingReports = true;
+        pendingReports.swap(mPendingReports);
+    }
+    while (true)
+    {
+        for (auto const & report : pendingReports)
+        {
+            try
+            {
+                mReportReceived(*this, report);
+            }
+            catch (...)
+            {
+                if (!handlerError)
+                {
+                    handlerError = std::current_exception();
+                }
+            }
+        }
+        std::scoped_lock lock(mReportMutex);
+        if (mPendingReports.empty())
+        {
+            mDrainingPendingReports = false;
+            break;
+        }
+        pendingReports.clear();
+        pendingReports.swap(mPendingReports);
+    }
+    if (handlerError)
+    {
+        std::scoped_lock lock(mReportMutex);
+        mReportReceived.remove(token);
+        --mReportHandlerCount;
+        std::rethrow_exception(handlerError);
+    }
+    return token;
+}
+
+void EventSubscription::ReportReceived(event_token const & token) noexcept
+{
+    std::scoped_lock lock(mReportMutex);
+    mReportReceived.remove(token);
+    if (mReportHandlerCount > 0)
+    {
+        --mReportHandlerCount;
+    }
+}
+
+Windows::Foundation::IAsyncAction EventSubscription::CloseAsync()
+{
+    co_await resume_background();
+    std::function<void()> close;
+    {
+        std::scoped_lock lock(mReportMutex);
+        close = std::move(mClose);
+    }
+    if (close)
+    {
+        close();
+    }
+}
+
+void EventSubscription::Publish(Controller::EventReportEventArgs const & args)
+{
+    {
+        std::scoped_lock lock(mReportMutex);
+        if (mReportHandlerCount == 0 || mDrainingPendingReports)
+        {
+            if (mPendingReports.size() == kMaximumPendingReports)
+            {
+                mPendingReports.erase(mPendingReports.begin());
+            }
+            mPendingReports.push_back(args);
+            return;
+        }
+    }
+    mReportReceived(*this, args);
+}
+
 AttributeReportEventArgs::AttributeReportEventArgs(Controller::AttributeValue value) : mValue(std::move(value)) {}
 
 Controller::AttributeValue AttributeReportEventArgs::Value() const
@@ -1643,26 +2665,93 @@ AttributeSubscription::AttributeSubscription(std::function<void()> close) : mClo
 event_token AttributeSubscription::ReportReceived(
     Windows::Foundation::TypedEventHandler<Controller::AttributeSubscription, Controller::AttributeReportEventArgs> const & handler)
 {
-    return mReportReceived.add(handler);
+    std::vector<Controller::AttributeReportEventArgs> pendingReports;
+    std::exception_ptr handlerError;
+    event_token token;
+    {
+        std::scoped_lock lock(mReportMutex);
+        token = mReportReceived.add(handler);
+        ++mReportHandlerCount;
+        if (mReportHandlerCount > 1)
+        {
+            return token;
+        }
+        mDrainingPendingReports = true;
+        pendingReports.swap(mPendingReports);
+    }
+    while (true)
+    {
+        for (auto const & report : pendingReports)
+        {
+            try
+            {
+                mReportReceived(*this, report);
+            }
+            catch (...)
+            {
+                if (!handlerError)
+                {
+                    handlerError = std::current_exception();
+                }
+            }
+        }
+        std::scoped_lock lock(mReportMutex);
+        if (mPendingReports.empty())
+        {
+            mDrainingPendingReports = false;
+            break;
+        }
+        pendingReports.clear();
+        pendingReports.swap(mPendingReports);
+    }
+    if (handlerError)
+    {
+        std::scoped_lock lock(mReportMutex);
+        mReportReceived.remove(token);
+        --mReportHandlerCount;
+        std::rethrow_exception(handlerError);
+    }
+    return token;
 }
 
 void AttributeSubscription::ReportReceived(event_token const & token) noexcept
 {
+    std::scoped_lock lock(mReportMutex);
     mReportReceived.remove(token);
+    if (mReportHandlerCount > 0)
+    {
+        --mReportHandlerCount;
+    }
 }
 
 Windows::Foundation::IAsyncAction AttributeSubscription::CloseAsync()
 {
     co_await resume_background();
-    if (mClose)
+    std::function<void()> close;
     {
-        mClose();
-        mClose = {};
+        std::scoped_lock lock(mReportMutex);
+        close = std::move(mClose);
+    }
+    if (close)
+    {
+        close();
     }
 }
 
 void AttributeSubscription::Publish(Controller::AttributeReportEventArgs const & args)
 {
+    {
+        std::scoped_lock lock(mReportMutex);
+        if (mReportHandlerCount == 0 || mDrainingPendingReports)
+        {
+            if (mPendingReports.size() == kMaximumPendingReports)
+            {
+                mPendingReports.erase(mPendingReports.begin());
+            }
+            mPendingReports.push_back(args);
+            return;
+        }
+    }
     mReportReceived(*this, args);
 }
 
@@ -1829,6 +2918,16 @@ Windows::Foundation::IAsyncOperation<Controller::BasicInformation> BasicInformat
 
 MatterController::MatterController(std::shared_ptr<ControllerRuntime> runtime) : mRuntime(std::move(runtime)) {}
 
+std::shared_ptr<ControllerRuntime> MatterController::Runtime()
+{
+    std::scoped_lock lock(mRuntimeMutex);
+    if (!mRuntime)
+    {
+        throw hresult_illegal_method_call(L"The Matter controller is closed.");
+    }
+    return mRuntime;
+}
+
 Windows::Foundation::IAsyncOperation<Controller::MatterController>
 MatterController::CreateAsync(Controller::ControllerOptions options)
 {
@@ -1857,9 +2956,10 @@ MatterController::CommissionOnNetworkAsync(Controller::OnNetworkCommissioningPar
     auto progress = winrt::make<implementation::CommissioningProgressEventArgs>(Controller::CommissioningStage::Discovering,
                                                                                 L"Starting on-network commissioning");
     mCommissioningProgress(*this, progress);
+    auto runtime = Runtime();
     co_await resume_background();
-    auto node = mRuntime->Commission(parameters.NodeId(), parameters.SetupPinCode(), parameters.LongDiscriminator(), false,
-                                     to_string(parameters.SetupCode()));
+    auto node = runtime->Commission(parameters.NodeId(), parameters.SetupPinCode(), parameters.LongDiscriminator(), false,
+                                    to_string(parameters.SetupCode()));
     progress = winrt::make<implementation::CommissioningProgressEventArgs>(Controller::CommissioningStage::Complete,
                                                                            L"Commissioning complete");
     mCommissioningProgress(*this, progress);
@@ -1876,8 +2976,9 @@ MatterController::CommissionBleAsync(Controller::BleCommissioningParameters para
     auto progress = winrt::make<implementation::CommissioningProgressEventArgs>(Controller::CommissioningStage::Discovering,
                                                                                 L"Starting BLE commissioning");
     mCommissioningProgress(*this, progress);
+    auto runtime = Runtime();
     co_await resume_background();
-    auto node = mRuntime->Commission(parameters.NodeId(), parameters.SetupPinCode(), parameters.LongDiscriminator(), true);
+    auto node = runtime->Commission(parameters.NodeId(), parameters.SetupPinCode(), parameters.LongDiscriminator(), true);
     progress = winrt::make<implementation::CommissioningProgressEventArgs>(Controller::CommissioningStage::Complete,
                                                                            L"Commissioning complete");
     mCommissioningProgress(*this, progress);
@@ -1886,18 +2987,20 @@ MatterController::CommissionBleAsync(Controller::BleCommissioningParameters para
 
 Windows::Foundation::Collections::IVectorView<Controller::CommissionedNode> MatterController::CommissionedNodes()
 {
+    auto runtime = Runtime();
     std::vector<Controller::CommissionedNode> nodes;
-    for (uint64_t nodeId : mRuntime->CommissionedNodes())
+    for (uint64_t nodeId : runtime->CommissionedNodes())
     {
-        nodes.push_back(winrt::make<implementation::CommissionedNode>(nodeId, mRuntime->FabricIndex()));
+        nodes.push_back(winrt::make<implementation::CommissionedNode>(nodeId, runtime->FabricIndex()));
     }
     return single_threaded_vector(std::move(nodes)).GetView();
 }
 
 Windows::Foundation::IAsyncAction MatterController::RemoveNodeAsync(uint64_t nodeId)
 {
+    auto runtime = Runtime();
     co_await resume_background();
-    mRuntime->RemoveNode(nodeId);
+    runtime->RemoveNode(nodeId);
 }
 
 Windows::Foundation::IAsyncOperation<Controller::AttributeValue>
@@ -1907,8 +3010,9 @@ MatterController::ReadAttributeAsync(uint64_t nodeId, Controller::AttributePath 
     {
         throw hresult_invalid_argument(L"path cannot be null.");
     }
+    auto runtime = Runtime();
     co_await resume_background();
-    auto data = mRuntime->ReadAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId());
+    auto data = runtime->ReadAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId());
     co_return winrt::make<implementation::AttributeValue>(path, data);
 }
 
@@ -1919,8 +3023,23 @@ Windows::Foundation::IAsyncAction MatterController::WriteAttributeAsync(
     {
         throw hresult_invalid_argument(L"path and value cannot be null.");
     }
+    auto runtime = Runtime();
     co_await resume_background();
-    mRuntime->WriteAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId(), value);
+    runtime->WriteAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId(), value);
+}
+
+Windows::Foundation::IAsyncAction MatterController::WriteAttributeTimedAsync(
+    uint64_t nodeId, Controller::AttributePath path, Windows::Foundation::Collections::IPropertySet value,
+    Controller::TimedInteractionOptions options)
+{
+    if (!path || !value || !options)
+    {
+        throw hresult_invalid_argument(L"path, value, and options cannot be null.");
+    }
+    auto runtime = Runtime();
+    co_await resume_background();
+    runtime->WriteAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId(), value,
+                            options.TimeoutMilliseconds());
 }
 
 Windows::Foundation::IAsyncOperation<Controller::CommandResult> MatterController::InvokeCommandAsync(
@@ -1930,8 +3049,24 @@ Windows::Foundation::IAsyncOperation<Controller::CommandResult> MatterController
     {
         throw hresult_invalid_argument(L"path and arguments cannot be null.");
     }
+    auto runtime = Runtime();
     co_await resume_background();
-    auto data = mRuntime->InvokeCommand(nodeId, path.EndpointId(), path.ClusterId(), path.CommandId(), arguments);
+    auto data = runtime->InvokeCommand(nodeId, path.EndpointId(), path.ClusterId(), path.CommandId(), arguments);
+    co_return winrt::make<implementation::CommandResult>(path, data);
+}
+
+Windows::Foundation::IAsyncOperation<Controller::CommandResult> MatterController::InvokeCommandTimedAsync(
+    uint64_t nodeId, Controller::CommandPath path, Windows::Foundation::Collections::IPropertySet arguments,
+    Controller::TimedInteractionOptions options)
+{
+    if (!path || !arguments || !options)
+    {
+        throw hresult_invalid_argument(L"path, arguments, and options cannot be null.");
+    }
+    auto runtime = Runtime();
+    co_await resume_background();
+    auto data = runtime->InvokeCommand(nodeId, path.EndpointId(), path.ClusterId(), path.CommandId(), arguments,
+                                       options.TimeoutMilliseconds());
     co_return winrt::make<implementation::CommandResult>(path, data);
 }
 
@@ -1943,32 +3078,529 @@ MatterController::SubscribeAttributeAsync(uint64_t nodeId, Controller::Attribute
     {
         throw hresult_invalid_argument(L"path cannot be null.");
     }
+    auto runtime = Runtime();
     co_await resume_background();
-    co_return mRuntime->SubscribeAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId(),
-                                           minimumIntervalSeconds, maximumIntervalSeconds);
+    co_return runtime->SubscribeAttribute(nodeId, path.EndpointId(), path.ClusterId(), path.AttributeId(),
+                                          minimumIntervalSeconds, maximumIntervalSeconds);
+}
+
+Windows::Foundation::IAsyncOperation<Windows::Foundation::Collections::IVectorView<Controller::EventValue>>
+MatterController::ReadEventsAsync(uint64_t nodeId, Controller::EventPath path, uint64_t minimumEventNumber)
+{
+    if (!path)
+    {
+        throw hresult_invalid_argument(L"path cannot be null.");
+    }
+    auto runtime = Runtime();
+    co_await resume_background();
+    auto values = runtime->ReadEvents(nodeId, path.EndpointId(), path.ClusterId(), path.EventId(), path.Urgent(),
+                                      minimumEventNumber);
+    co_return single_threaded_vector(std::move(values)).GetView();
+}
+
+Windows::Foundation::IAsyncOperation<Controller::EventSubscription>
+MatterController::SubscribeEventAsync(uint64_t nodeId, Controller::EventPath path, uint64_t minimumEventNumber,
+                                      uint16_t minimumIntervalSeconds, uint16_t maximumIntervalSeconds)
+{
+    if (!path)
+    {
+        throw hresult_invalid_argument(L"path cannot be null.");
+    }
+    auto runtime = Runtime();
+    co_await resume_background();
+    co_return runtime->SubscribeEvent(nodeId, path.EndpointId(), path.ClusterId(), path.EventId(), path.Urgent(),
+                                      minimumEventNumber, minimumIntervalSeconds, maximumIntervalSeconds);
 }
 
 Controller::OnOffCluster MatterController::GetOnOffCluster(uint64_t nodeId, uint16_t endpointId)
 {
-    return winrt::make<OnOffCluster>(mRuntime, nodeId, endpointId);
+    return winrt::make<OnOffCluster>(Runtime(), nodeId, endpointId);
 }
 
 Controller::LevelControlCluster MatterController::GetLevelControlCluster(uint64_t nodeId, uint16_t endpointId)
 {
-    return winrt::make<LevelControlCluster>(mRuntime, nodeId, endpointId);
+    return winrt::make<LevelControlCluster>(Runtime(), nodeId, endpointId);
 }
 
 Controller::BasicInformationCluster MatterController::GetBasicInformationCluster(uint64_t nodeId, uint16_t endpointId)
 {
-    return winrt::make<BasicInformationCluster>(mRuntime, nodeId, endpointId);
+    return winrt::make<BasicInformationCluster>(Runtime(), nodeId, endpointId);
+}
+
+Windows::Foundation::IAsyncOperation<Controller::CommissionedNode>
+MatterControllerRecovery::RecoverNodeAsync(uint64_t nodeId)
+{
+    co_await resume_background();
+    co_return mRuntime->RecoverNode(nodeId);
+}
+
+MatterControllerRecovery::MatterControllerRecovery(Controller::MatterController controller)
+{
+    if (!controller)
+    {
+        throw hresult_invalid_argument(L"controller cannot be null.");
+    }
+    mRuntime = get_self<implementation::MatterController>(controller)->Runtime();
+}
+
+MatterControllerNetworkCommissioning::MatterControllerNetworkCommissioning(Controller::MatterController controller)
+{
+    if (!controller)
+    {
+        throw hresult_invalid_argument(L"controller cannot be null.");
+    }
+    mRuntime = get_self<implementation::MatterController>(controller)->Runtime();
+}
+
+Windows::Foundation::IAsyncOperation<Controller::CommissionedNode>
+MatterControllerNetworkCommissioning::CommissionBleAsync(Controller::BleNetworkCommissioningParameters parameters)
+{
+    if (!parameters)
+    {
+        throw hresult_invalid_argument(L"parameters cannot be null.");
+    }
+
+    auto wiFi  = parameters.WiFi();
+    auto thread = parameters.Thread();
+    if (static_cast<bool>(wiFi) == static_cast<bool>(thread))
+    {
+        throw hresult_invalid_argument(L"Provide exactly one Wi-Fi or Thread credential set.");
+    }
+
+    std::optional<WiFiCredentials> nativeWiFi;
+    ByteSpan threadDataset;
+    if (wiFi)
+    {
+        auto implementation = get_self<implementation::WiFiNetworkCredentials>(wiFi);
+        auto const & ssid       = implementation->Ssid();
+        auto const & passphrase = implementation->Passphrase();
+        nativeWiFi.emplace(ByteSpan(ssid.data(), ssid.size()), ByteSpan(passphrase.data(), passphrase.size()));
+    }
+    else
+    {
+        auto const & dataset = get_self<implementation::ThreadNetworkCredentials>(thread)->OperationalDataset();
+        threadDataset        = ByteSpan(dataset.data(), dataset.size());
+    }
+
+    uint64_t nodeId        = parameters.NodeId();
+    uint32_t setupPinCode  = parameters.SetupPinCode();
+    uint16_t discriminator = parameters.LongDiscriminator();
+    co_await resume_background();
+    co_return mRuntime->Commission(nodeId, setupPinCode, discriminator, true, {}, nativeWiFi, threadDataset);
+}
+
+Windows::Foundation::IAsyncOperation<Windows::Foundation::Collections::IVectorView<Controller::MatterNetworkInterface>>
+MatterNetworkInterfaceProvider::GetEligibleNetworkInterfacesAsync()
+{
+    co_await resume_background();
+    std::vector<Controller::MatterNetworkInterface> interfaces;
+    for (Inet::InterfaceIterator iterator; iterator.HasCurrent(); iterator.Next())
+    {
+        Inet::InterfaceId id = iterator.GetInterfaceId();
+        if (!id.IsPresent() || iterator.IsLoopback())
+        {
+            continue;
+        }
+
+        char nameBuffer[Inet::InterfaceId::kMaxIfNameLength] = {};
+        if (iterator.GetInterfaceName(nameBuffer, sizeof(nameBuffer)) != CHIP_NO_ERROR)
+        {
+            continue;
+        }
+
+        Inet::InterfaceType nativeType = Inet::InterfaceType::Unknown;
+        (void) iterator.GetInterfaceType(nativeType);
+        bool supportsIpv6 = false;
+        for (Inet::InterfaceAddressIterator addressIterator; addressIterator.HasCurrent(); addressIterator.Next())
+        {
+            Inet::IPAddress address;
+            if (addressIterator.GetInterfaceId() == id && addressIterator.GetAddress(address) == CHIP_NO_ERROR && address.IsIPv6())
+            {
+                supportsIpv6 = true;
+                break;
+            }
+        }
+
+        std::string name = nameBuffer;
+        std::string lowerName(name);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        bool isVirtual = lowerName.find("virtual") != std::string::npos || lowerName.find("vethernet") != std::string::npos ||
+            lowerName.find("hyper-v") != std::string::npos || lowerName.find("vpn") != std::string::npos;
+        interfaces.push_back(winrt::make<implementation::MatterNetworkInterface>(
+            id.GetPlatformInterface(), id.GetInterfaceIndex(), to_hstring(name),
+            static_cast<Controller::MatterNetworkInterfaceType>(nativeType), iterator.IsUp(), supportsIpv6,
+            iterator.SupportsMulticast(), isVirtual));
+    }
+    co_return single_threaded_vector(std::move(interfaces)).GetView();
+}
+
+MatterControllerCommissioning::MatterControllerCommissioning(Controller::MatterController controller)
+{
+    if (!controller)
+    {
+        throw hresult_invalid_argument(L"controller cannot be null.");
+    }
+    mRuntime = get_self<implementation::MatterController>(controller)->Runtime();
+}
+
+event_token MatterControllerCommissioning::ProgressChanged(
+    Windows::Foundation::TypedEventHandler<Controller::MatterControllerCommissioning,
+                                           Controller::MatterCommissioningProgress> const & handler)
+{
+    return mProgressChanged.add(handler);
+}
+
+void MatterControllerCommissioning::ProgressChanged(event_token const & token) noexcept
+{
+    mProgressChanged.remove(token);
+}
+
+void MatterControllerCommissioning::Publish(Controller::MatterCommissioningProgress const & progress)
+{
+    bool scheduleDrain = false;
+    {
+        std::scoped_lock lock(mProgressMutex);
+        mPendingProgress.push_back(progress);
+        if (!mProgressDrainScheduled)
+        {
+            mProgressDrainScheduled = true;
+            scheduleDrain            = true;
+        }
+    }
+    if (scheduleDrain)
+    {
+        auto strong = get_strong();
+        Windows::System::Threading::ThreadPool::RunAsync(
+            [strong = std::move(strong)](Windows::Foundation::IAsyncAction const &) { strong->DrainProgress(); });
+    }
+}
+
+void MatterControllerCommissioning::DrainProgress()
+{
+    while (true)
+    {
+        Controller::MatterCommissioningProgress progress{ nullptr };
+        {
+            std::scoped_lock lock(mProgressMutex);
+            if (mPendingProgress.empty())
+            {
+                mProgressDrainScheduled = false;
+                mProgressCondition.notify_all();
+                return;
+            }
+            progress = mPendingProgress.front();
+            mPendingProgress.erase(mPendingProgress.begin());
+        }
+        try
+        {
+            mProgressChanged(*this, progress);
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+void MatterControllerCommissioning::WaitForProgressDrain()
+{
+    std::unique_lock lock(mProgressMutex);
+    mProgressCondition.wait(lock, [this]() { return !mProgressDrainScheduled && mPendingProgress.empty(); });
+}
+
+Windows::Foundation::IAsyncOperation<Controller::MatterCommissioningResult>
+MatterControllerCommissioning::CommissionBleAsync(Controller::BleNetworkCommissioningParameters parameters,
+                                                   Controller::MatterNetworkInterfaceSelection interfaceSelection)
+{
+    auto lifetime = get_strong();
+    if (!parameters)
+    {
+        throw hresult_invalid_argument(L"parameters cannot be null.");
+    }
+    if (!interfaceSelection)
+    {
+        interfaceSelection = winrt::make<implementation::MatterNetworkInterfaceSelection>(
+            Controller::MatterNetworkInterfaceSelectionMode::Automatic, 0);
+    }
+
+    auto wiFi   = parameters.WiFi();
+    auto thread = parameters.Thread();
+    if (static_cast<bool>(wiFi) == static_cast<bool>(thread))
+    {
+        throw hresult_invalid_argument(L"Provide exactly one Wi-Fi or Thread credential set.");
+    }
+
+    std::optional<WiFiCredentials> nativeWiFi;
+    ByteSpan threadDataset;
+    if (wiFi)
+    {
+        auto implementation     = get_self<implementation::WiFiNetworkCredentials>(wiFi);
+        auto const & ssid       = implementation->Ssid();
+        auto const & passphrase = implementation->Passphrase();
+        nativeWiFi.emplace(ByteSpan(ssid.data(), ssid.size()), ByteSpan(passphrase.data(), passphrase.size()));
+    }
+    else
+    {
+        auto const & dataset = get_self<implementation::ThreadNetworkCredentials>(thread)->OperationalDataset();
+        threadDataset        = ByteSpan(dataset.data(), dataset.size());
+    }
+
+    AddressResolve::InterfaceSelection nativeSelection;
+    nativeSelection.interfaceId = Inet::InterfaceId(interfaceSelection.InterfaceId());
+    switch (interfaceSelection.Mode())
+    {
+    case Controller::MatterNetworkInterfaceSelectionMode::Automatic:
+        nativeSelection.mode = AddressResolve::InterfaceSelectionMode::kAutomatic;
+        break;
+    case Controller::MatterNetworkInterfaceSelectionMode::PreferSpecifiedInterface:
+        nativeSelection.mode = AddressResolve::InterfaceSelectionMode::kPrefer;
+        break;
+    case Controller::MatterNetworkInterfaceSelectionMode::RequireSpecifiedInterface:
+        nativeSelection.mode = AddressResolve::InterfaceSelectionMode::kRequire;
+        break;
+    default:
+        throw hresult_invalid_argument(L"Unknown network interface selection mode.");
+    }
+
+    hstring interfaceName;
+    if (nativeSelection.mode != AddressResolve::InterfaceSelectionMode::kAutomatic)
+    {
+        bool found             = false;
+        bool connected         = false;
+        bool supportsMulticast = false;
+        bool supportsIpv6      = false;
+        for (Inet::InterfaceIterator iterator; iterator.HasCurrent(); iterator.Next())
+        {
+            if (iterator.GetInterfaceId() != nativeSelection.interfaceId)
+            {
+                continue;
+            }
+            found             = true;
+            connected         = iterator.IsUp();
+            supportsMulticast = iterator.SupportsMulticast();
+            char nameBuffer[Inet::InterfaceId::kMaxIfNameLength] = {};
+            if (iterator.GetInterfaceName(nameBuffer, sizeof(nameBuffer)) == CHIP_NO_ERROR)
+            {
+                interfaceName = to_hstring(nameBuffer);
+            }
+            break;
+        }
+        if (found)
+        {
+            for (Inet::InterfaceAddressIterator iterator; iterator.HasCurrent(); iterator.Next())
+            {
+                Inet::IPAddress address;
+                if (iterator.GetInterfaceId() == nativeSelection.interfaceId &&
+                    iterator.GetAddress(address) == CHIP_NO_ERROR && address.IsIPv6())
+                {
+                    supportsIpv6 = true;
+                    break;
+                }
+            }
+        }
+        if (nativeSelection.mode == AddressResolve::InterfaceSelectionMode::kRequire)
+        {
+            if (!found)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceNotFound");
+            }
+            if (!connected)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceDisconnected");
+            }
+            if (!supportsIpv6)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceDoesNotSupportIpv6");
+            }
+            if (!supportsMulticast)
+            {
+                throw hresult_invalid_argument(L"PreferredInterfaceDoesNotSupportMulticast");
+            }
+        }
+    }
+
+    struct ProgressState
+    {
+        std::mutex mutex;
+        Controller::MatterCommissioningStage lastCompleted = Controller::MatterCommissioningStage::Unknown;
+        Controller::MatterCommissioningStage active        = Controller::MatterCommissioningStage::SearchingForDevice;
+        int32_t nativeStageId                               = -1;
+        int32_t nativeError                                 = 0;
+        uint32_t attemptNumber                              = 1;
+        uint64_t networkInterfaceId                         = 0;
+        hstring networkInterfaceName;
+    };
+
+    auto state = std::make_shared<ProgressState>();
+    auto start = std::chrono::steady_clock::now();
+    uint64_t interfaceId = interfaceSelection.InterfaceId();
+    state->networkInterfaceId   = interfaceId;
+    state->networkInterfaceName = interfaceName;
+    auto selectionMode          = interfaceSelection.Mode();
+    auto weak            = get_weak();
+    Publish(winrt::make<implementation::MatterCommissioningProgress>(
+        Controller::MatterCommissioningStage::SearchingForDevice, Controller::MatterCommissioningStage::Unknown, -1,
+        Controller::MatterCommissioningTransport::Bluetooth, Windows::Foundation::TimeSpan::zero(),
+        L"Searching for the Matter device over Bluetooth.", L"Searching for device", interfaceId, interfaceName, 1, false));
+
+    CommissioningProgressCallback callback = [weak, state, start, selectionMode](const NativeCommissioningProgress & update) {
+        auto self = weak.get();
+        if (!self)
+        {
+            return;
+        }
+        Controller::MatterCommissioningStage stage = ProjectCommissioningStage(update.stage);
+        Controller::MatterCommissioningStage lastCompleted;
+        uint32_t attemptNumber;
+        uint64_t currentInterfaceId;
+        hstring currentInterfaceName;
+        {
+            std::scoped_lock lock(state->mutex);
+            state->active        = stage;
+            state->nativeStageId = static_cast<int32_t>(update.stage);
+            state->nativeError   = update.error.AsInteger();
+            if (update.completed && update.error == CHIP_NO_ERROR)
+            {
+                state->lastCompleted = stage;
+            }
+            if (update.retrying)
+            {
+                ++state->attemptNumber;
+                if (selectionMode == Controller::MatterNetworkInterfaceSelectionMode::PreferSpecifiedInterface)
+                {
+                    state->networkInterfaceId   = 0;
+                    state->networkInterfaceName = {};
+                }
+            }
+            lastCompleted        = state->lastCompleted;
+            attemptNumber        = state->attemptNumber;
+            currentInterfaceId   = state->networkInterfaceId;
+            currentInterfaceName = state->networkInterfaceName;
+        }
+        char const * nativeName = StageToString(update.stage);
+        hstring message = to_hstring(nativeName != nullptr && nativeName[0] != '\0' ? nativeName : "Unknown commissioning stage");
+        auto elapsed = std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start);
+        self->Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            stage, lastCompleted, static_cast<int32_t>(update.stage), ProjectCommissioningTransport(update.stage), elapsed,
+            message, message, currentInterfaceId, currentInterfaceName, attemptNumber, update.retrying));
+    };
+
+    uint64_t nodeId        = parameters.NodeId();
+    uint32_t setupPinCode  = parameters.SetupPinCode();
+    uint16_t discriminator = parameters.LongDiscriminator();
+    auto cancellationRequested = std::make_shared<std::atomic_bool>(false);
+    auto cancellation          = co_await get_cancellation_token();
+    cancellation.enable_propagation();
+    auto runtime = lifetime->mRuntime;
+    cancellation.callback([runtime, nodeId, cancellationRequested]() noexcept {
+        cancellationRequested->store(true, std::memory_order_release);
+        runtime->CancelCommission(nodeId);
+    });
+    co_await resume_background();
+    if (cancellation())
+    {
+        Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            Controller::MatterCommissioningStage::Failed, Controller::MatterCommissioningStage::Unknown, -1,
+            Controller::MatterCommissioningTransport::Bluetooth,
+            std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+            L"Commissioning was canceled.", L"Commissioning canceled", interfaceId, interfaceName, 1, false));
+        WaitForProgressDrain();
+        throw hresult_canceled();
+    }
+    try
+    {
+        auto node = mRuntime->Commission(nodeId, setupPinCode, discriminator, true, {}, nativeWiFi, threadDataset,
+                                         MakeOptional(nativeSelection), std::move(callback), cancellationRequested);
+        Controller::MatterCommissioningStage lastCompleted;
+        uint32_t attemptNumber;
+        uint64_t currentInterfaceId;
+        hstring currentInterfaceName;
+        {
+            std::scoped_lock lock(state->mutex);
+            lastCompleted        = state->lastCompleted;
+            attemptNumber        = state->attemptNumber;
+            currentInterfaceId   = state->networkInterfaceId;
+            currentInterfaceName = state->networkInterfaceName;
+        }
+        Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            Controller::MatterCommissioningStage::Completed, lastCompleted, -1,
+            Controller::MatterCommissioningTransport::OperationalIp,
+            std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+            L"Commissioning completed.", L"Commissioning complete", currentInterfaceId, currentInterfaceName, attemptNumber, false));
+        auto result = winrt::make<implementation::MatterCommissioningResult>(
+            true, Controller::MatterCommissioningOutcome::Succeeded, Controller::MatterCommissioningFailureKind::Unknown,
+            Controller::MatterCommissioningStage::Unknown, lastCompleted, -1, 0, L"Commissioning completed.", interfaceId, node);
+        WaitForProgressDrain();
+        co_return result;
+    }
+    catch (hresult_error const & error)
+    {
+        if (cancellationRequested->load(std::memory_order_acquire))
+        {
+            Controller::MatterCommissioningStage lastCompleted;
+            int32_t nativeStageId;
+            uint32_t attemptNumber;
+            uint64_t currentInterfaceId;
+            hstring currentInterfaceName;
+            {
+                std::scoped_lock lock(state->mutex);
+                lastCompleted        = state->lastCompleted;
+                nativeStageId        = state->nativeStageId;
+                attemptNumber        = state->attemptNumber;
+                currentInterfaceId   = state->networkInterfaceId;
+                currentInterfaceName = state->networkInterfaceName;
+            }
+            Publish(winrt::make<implementation::MatterCommissioningProgress>(
+                Controller::MatterCommissioningStage::Failed, lastCompleted, nativeStageId,
+                Controller::MatterCommissioningTransport::Unknown,
+                std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+                L"Commissioning was canceled.", L"Commissioning canceled", currentInterfaceId, currentInterfaceName,
+                attemptNumber, false));
+            WaitForProgressDrain();
+            throw hresult_canceled();
+        }
+        Controller::MatterCommissioningStage failedStage;
+        Controller::MatterCommissioningStage lastCompleted;
+        int32_t nativeStageId;
+        int32_t nativeError;
+        uint32_t attemptNumber;
+        uint64_t currentInterfaceId;
+        hstring currentInterfaceName;
+        {
+            std::scoped_lock lock(state->mutex);
+            failedStage         = state->active;
+            lastCompleted       = state->lastCompleted;
+            nativeStageId       = state->nativeStageId;
+            nativeError         = state->nativeError;
+            attemptNumber       = state->attemptNumber;
+            currentInterfaceId   = state->networkInterfaceId;
+            currentInterfaceName = state->networkInterfaceName;
+        }
+        bool timedOut = error.code() == HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        Publish(winrt::make<implementation::MatterCommissioningProgress>(
+            Controller::MatterCommissioningStage::Failed, lastCompleted, nativeStageId,
+            Controller::MatterCommissioningTransport::Unknown,
+            std::chrono::duration_cast<Windows::Foundation::TimeSpan>(std::chrono::steady_clock::now() - start),
+            error.message(), L"Commissioning failed", currentInterfaceId, currentInterfaceName, attemptNumber, false));
+        auto result = winrt::make<implementation::MatterCommissioningResult>(
+            false, timedOut ? Controller::MatterCommissioningOutcome::TimedOut : Controller::MatterCommissioningOutcome::Failed,
+            ClassifyCommissioningFailure(failedStage, timedOut),
+            failedStage, lastCompleted, nativeStageId, nativeError, error.message(), interfaceId, nullptr);
+        WaitForProgressDrain();
+        co_return result;
+    }
 }
 
 Windows::Foundation::IAsyncAction MatterController::CloseAsync()
 {
-    if (mRuntime)
+    std::shared_ptr<ControllerRuntime> runtime;
     {
-        mRuntime->Close();
-        mRuntime.reset();
+        std::scoped_lock lock(mRuntimeMutex);
+        runtime = std::move(mRuntime);
+    }
+    if (runtime)
+    {
+        runtime->Close();
     }
     co_return;
 }

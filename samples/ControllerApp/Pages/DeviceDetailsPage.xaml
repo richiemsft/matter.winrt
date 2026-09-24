@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<Page
+    x:Class="MatterControllerApp.Pages.DeviceDetailsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:MatterControllerApp.Pages"
+    xmlns:viewModels="using:MatterControllerApp.ViewModels">
+
+    <Grid Padding="36,24,36,36" RowSpacing="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <Grid ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Button
+                x:Name="BackButton"
+                Click="OnBackClicked"
+                VerticalAlignment="Center"
+                AutomationProperties.Name="Back to devices"
+                AutomationProperties.AutomationId="BackToDevicesButton"
+                ToolTipService.ToolTip="Back to devices">
+                <SymbolIcon Symbol="Back" />
+            </Button>
+            <StackPanel Grid.Column="1" Spacing="2">
+                <TextBlock
+                    Text="{x:Bind ViewModel.DisplayName, Mode=OneWay}"
+                    Style="{StaticResource TitleTextBlockStyle}" />
+                <TextBlock
+                    Text="Device details and controls"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </StackPanel>
+            <Button
+                Grid.Column="2"
+                Content="Refresh"
+                Command="{x:Bind ViewModel.RefreshCommand}"
+                VerticalAlignment="Center"
+                AutomationProperties.AutomationId="RefreshDeviceButton" />
+        </Grid>
+
+        <ScrollViewer Grid.Row="1">
+            <StackPanel MaxWidth="900" HorizontalAlignment="Stretch" Spacing="16">
+                <Border
+                    Padding="20"
+                    CornerRadius="8"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1">
+                    <StackPanel Spacing="12">
+                        <TextBlock
+                            Text="Device information"
+                            Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <TextBlock
+                            Text="{x:Bind ViewModel.DeviceInformation, Mode=OneWay}"
+                            TextWrapping="Wrap" />
+                        <NumberBox
+                            Header="Endpoint"
+                            Value="{x:Bind ViewModel.EndpointId, Mode=TwoWay}"
+                            SpinButtonPlacementMode="Compact"
+                            Width="180"
+                            HorizontalAlignment="Left"
+                            AutomationProperties.AutomationId="DeviceEndpoint" />
+                    </StackPanel>
+                </Border>
+
+                <Border
+                    Padding="20"
+                    CornerRadius="8"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Visibility="{x:Bind local:DeviceDetailsPage.When(ViewModel.HasOnOff), Mode=OneWay}">
+                    <StackPanel Spacing="12">
+                        <TextBlock
+                            Text="Lights"
+                            Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="80" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="180" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock
+                                Text="Light"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock
+                                Grid.Column="1"
+                                Text="State"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock
+                                Grid.Column="2"
+                                Text="Control"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                            <TextBlock
+                                Grid.Column="3"
+                                Text="Matter Controls widget"
+                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </Grid>
+                        <ItemsRepeater ItemsSource="{x:Bind ViewModel.OnOffEndpoints}">
+                            <ItemsRepeater.ItemTemplate>
+                                <DataTemplate x:DataType="viewModels:OnOffEndpointViewModel">
+                                    <Grid
+                                        Padding="0,6"
+                                        ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="80" />
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="180" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock
+                                            Text="{x:Bind DisplayName}"
+                                            VerticalAlignment="Center" />
+                                        <TextBlock
+                                            Grid.Column="1"
+                                            Text="{x:Bind local:DeviceDetailsPage.OnOffText(IsOn), Mode=OneWay}"
+                                            VerticalAlignment="Center" />
+                                        <Button
+                                            Grid.Column="2"
+                                            Content="Toggle"
+                                            Tag="{x:Bind}"
+                                            Click="OnEndpointToggleClicked"
+                                            AutomationProperties.AutomationId="{x:Bind ToggleAutomationId}" />
+                                        <ToggleSwitch
+                                            Grid.Column="3"
+                                            OffContent="Not included"
+                                            OnContent="Included"
+                                            Tag="{x:Bind}"
+                                            IsOn="{x:Bind IsInWidget, Mode=OneWay}"
+                                            Toggled="OnWidgetSelectionToggled"
+                                            AutomationProperties.Name="{x:Bind DisplayName}"
+                                            AutomationProperties.AutomationId="{x:Bind WidgetAutomationId}" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsRepeater.ItemTemplate>
+                        </ItemsRepeater>
+                    </StackPanel>
+                </Border>
+
+                <Border
+                    Padding="20"
+                    CornerRadius="8"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    Visibility="{x:Bind local:DeviceDetailsPage.When(ViewModel.HasLevelControl), Mode=OneWay}">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="Level" Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <Slider
+                            Header="Current level"
+                            Minimum="0"
+                            Maximum="254"
+                            StepFrequency="1"
+                            Value="{x:Bind ViewModel.Level, Mode=TwoWay}"
+                            AutomationProperties.AutomationId="DeviceLevel" />
+                        <Button
+                            Content="Set level"
+                            HorizontalAlignment="Left"
+                            Command="{x:Bind ViewModel.SetLevelCommand}"
+                            AutomationProperties.AutomationId="SetDeviceLevelButton" />
+                    </StackPanel>
+                </Border>
+
+                <Border
+                    Padding="20"
+                    CornerRadius="8"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1">
+                    <StackPanel Spacing="12">
+                        <TextBlock
+                            Text="Attribute state"
+                            Style="{StaticResource SubtitleTextBlockStyle}" />
+                        <Grid ColumnSpacing="12">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox
+                                Header="Cluster ID"
+                                PlaceholderText="Decimal or 0x-prefixed"
+                                Text="{x:Bind ViewModel.ClusterId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                AutomationProperties.AutomationId="ClusterId" />
+                            <TextBox
+                                Grid.Column="1"
+                                Header="Attribute ID"
+                                PlaceholderText="Decimal or 0x-prefixed"
+                                Text="{x:Bind ViewModel.AttributeId, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                AutomationProperties.AutomationId="AttributeId" />
+                        </Grid>
+                        <Button
+                            Content="Read attribute"
+                            HorizontalAlignment="Left"
+                            Command="{x:Bind ViewModel.ReadAttributeCommand}"
+                            AutomationProperties.AutomationId="ReadAttributeButton" />
+                        <TextBox
+                            Header="Decoded value"
+                            Text="{x:Bind ViewModel.QueryResult, Mode=OneWay}"
+                            IsReadOnly="True"
+                            AcceptsReturn="True"
+                            TextWrapping="Wrap"
+                            MinHeight="100" />
+                    </StackPanel>
+                </Border>
+
+                <Button
+                    Content="Remove device"
+                    HorizontalAlignment="Left"
+                    Click="OnRemoveDeviceClicked"
+                    AutomationProperties.AutomationId="RemoveDeviceButton" />
+            </StackPanel>
+        </ScrollViewer>
+
+        <Grid Grid.Row="2" ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <ProgressRing
+                Width="20"
+                Height="20"
+                IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}" />
+            <TextBlock
+                Grid.Column="1"
+                Text="{x:Bind ViewModel.Status, Mode=OneWay}"
+                TextWrapping="Wrap"
+                VerticalAlignment="Center" />
+        </Grid>
+    </Grid>
+</Page>

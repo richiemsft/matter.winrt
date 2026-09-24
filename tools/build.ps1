@@ -2,7 +2,7 @@
 param(
     [ValidateSet("x64", "arm64", "all")]
     [string] $Architecture = "all",
-    [string] $Version = "0.1.0-preview.4",
+    [string] $Version = "0.1.0-preview.11",
     [string] $OutputDirectory = "artifacts",
     [switch] $SkipBuild
 )
@@ -11,52 +11,15 @@ $ErrorActionPreference = "Stop"
 $outerRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $architectures = if ($Architecture -eq "all") { @("x64", "arm64") } else { @($Architecture) }
 $sdkRoot = Join-Path $outerRoot "matterforwindows"
-$sdkDirectories = @(
-    "build",
-    "build_overrides",
-    "config",
-    "credentials",
-    "data_model",
-    "docs",
-    "examples",
-    "integrations",
-    "scripts",
-    "src",
-    "third_party",
-    "zzz_generated"
-)
-
-foreach ($directory in $sdkDirectories) {
-    $overlayPath = Join-Path $outerRoot $directory
-    if (-not (Test-Path $overlayPath)) {
-        New-Item -ItemType Junction -Path $overlayPath -Target (Join-Path $sdkRoot $directory) | Out-Null
-    }
-}
 
 foreach ($targetArchitecture in $architectures) {
     $outputName = "win-winrt-$targetArchitecture"
     $outputPath = Join-Path $outerRoot "out\$outputName"
     if (-not $SkipBuild) {
-        . (Join-Path $sdkRoot "scripts\setup\windows.ps1") -Architecture $targetArchitecture
-        $gn = Join-Path $outerRoot "matterforwindows\.environment\windows\gn\gn.exe"
-        $ninja = Join-Path $outerRoot "matterforwindows\.environment\windows\ninja\ninja.exe"
-        $gnArgs = @(
-            'target_os="win"'
-            "target_cpu=`"$targetArchitecture`""
-            'chip_device_platform="windows"'
-            'chip_windows_canonical_compile_probes=true'
-            'chip_windows_device_layer_probe=true'
-            'chip_windows_enable_cxx20=true'
-            'chip_with_nlfaultinjection=false'
-            'chip_build_tests=false'
-            'chip_build_tools=false'
-            'chip_caller_handles_critical_failure=true'
-            'is_debug=false'
-        ) -join " "
-        & $gn gen $outputPath "--root=$outerRoot" "--args=$gnArgs"
-        if ($LASTEXITCODE -ne 0) { throw "GN generation failed for $targetArchitecture." }
-        & $ninja -C $outputPath winrt:Matter.Windows.Controller
-        if ($LASTEXITCODE -ne 0) { throw "Component build failed for $targetArchitecture." }
+        & (Join-Path $PSScriptRoot "build-matter.ps1") -Architecture $targetArchitecture
+        if ($LASTEXITCODE -ne 0) { throw "Matter SDK build failed for $targetArchitecture." }
+        & (Join-Path $PSScriptRoot "build-winrt.ps1") -Architecture $targetArchitecture
+        if ($LASTEXITCODE -ne 0) { throw "WinRT component build failed for $targetArchitecture." }
     }
 
     foreach ($asset in @("Matter.Windows.Controller.dll", "Matter.Windows.Controller.winmd")) {

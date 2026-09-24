@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentDialog
+    x:Class="MatterControllerApp.Dialogs.AddDeviceDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:MatterControllerApp.Dialogs"
+    Title="Add device"
+    PrimaryButtonText="Connect"
+    CloseButtonText="Cancel"
+    DefaultButton="Primary"
+    PrimaryButtonClick="OnPrimaryButtonClick"
+    Closing="OnClosing"
+    Loaded="OnLoaded">
+
+    <ScrollViewer MaxHeight="620">
+        <StackPanel MinWidth="480" Spacing="18">
+            <TextBlock
+                Text="Connect a Matter device."
+                TextWrapping="Wrap"
+                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+            <StackPanel
+                Spacing="18"
+                Visibility="{x:Bind local:AddDeviceDialog.When(ViewModel.IsConnecting), Mode=OneWay}">
+                <RadioButtons
+                    Header="Connection method"
+                    IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                    SelectedIndex="{x:Bind ViewModel.ConnectionMethodIndex, Mode=TwoWay}">
+                    <RadioButton
+                        Content="Sharing code"
+                        AutomationProperties.AutomationId="SharingCodeMethod" />
+                    <RadioButton
+                        Content="Bluetooth LE"
+                        AutomationProperties.AutomationId="BluetoothMethod" />
+                </RadioButtons>
+
+                <StackPanel
+                    Spacing="10"
+                    Visibility="{x:Bind local:AddDeviceDialog.When(ViewModel.UsesSharingCode), Mode=OneWay}">
+                    <ComboBox
+                        Header="Camera"
+                        ItemsSource="{x:Bind ViewModel.Cameras, Mode=OneWay}"
+                        SelectedItem="{x:Bind ViewModel.SelectedCamera, Mode=TwoWay}"
+                        DisplayMemberPath="DisplayName"
+                        HorizontalAlignment="Stretch"
+                        IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                        AutomationProperties.AutomationId="QrCameraSelector" />
+                    <Button
+                        Style="{StaticResource AccentButtonStyle}"
+                        HorizontalAlignment="Stretch"
+                        IsEnabled="{x:Bind ViewModel.CanStartScan, Mode=OneWay}"
+                        Click="OnScanQrCodeClicked"
+                        AutomationProperties.AutomationId="ScanQrCodeButton">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <SymbolIcon Symbol="Camera" />
+                            <TextBlock Text="{x:Bind ViewModel.ScanButtonText, Mode=OneWay}" />
+                        </StackPanel>
+                    </Button>
+                    <TextBlock
+                        Text="Or enter a sharing code manually"
+                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                    <TextBox
+                        x:Name="SharingCodeBox"
+                        PlaceholderText="Manual code or MT: QR payload"
+                        IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                        Text="{x:Bind ViewModel.SharingCode, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                        AutomationProperties.Name="Sharing code"
+                        AutomationProperties.AutomationId="AddDeviceSharingCode" />
+                </StackPanel>
+
+                <StackPanel
+                    Spacing="10"
+                    Visibility="{x:Bind local:AddDeviceDialog.When(ViewModel.UsesBluetooth), Mode=OneWay}">
+                    <Grid ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <NumberBox
+                            Header="Setup PIN"
+                            IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                            Value="{x:Bind ViewModel.SetupPinCode, Mode=TwoWay}"
+                            SpinButtonPlacementMode="Compact"
+                            AutomationProperties.AutomationId="AddDeviceSetupPin" />
+                        <NumberBox
+                            Grid.Column="1"
+                            Header="Long discriminator"
+                            IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                            Value="{x:Bind ViewModel.LongDiscriminator, Mode=TwoWay}"
+                            SpinButtonPlacementMode="Compact"
+                            AutomationProperties.AutomationId="AddDeviceDiscriminator" />
+                    </Grid>
+                    <TextBox
+                        Header="Wi-Fi network name"
+                        IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                        Text="{x:Bind ViewModel.WiFiSsid, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                        AutomationProperties.AutomationId="AddDeviceWiFiSsid" />
+                    <PasswordBox
+                        Header="Wi-Fi password"
+                        IsEnabled="{x:Bind ViewModel.CanChangeConnection, Mode=OneWay}"
+                        Password="{x:Bind ViewModel.WiFiPassphrase, Mode=TwoWay}"
+                        AutomationProperties.AutomationId="AddDeviceWiFiPassphrase" />
+                </StackPanel>
+
+            </StackPanel>
+
+            <StackPanel
+                Spacing="12"
+                Visibility="{x:Bind local:AddDeviceDialog.When(ViewModel.IsNaming), Mode=OneWay}">
+                <TextBlock
+                    Text="The device is connected. Use its suggested name or enter a different one."
+                    TextWrapping="Wrap"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <TextBox
+                    Header="Device name"
+                    MaxLength="128"
+                    Text="{x:Bind ViewModel.DeviceName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                    AutomationProperties.AutomationId="AddDeviceName" />
+            </StackPanel>
+
+            <Grid ColumnSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <ProgressRing
+                    Width="20"
+                    Height="20"
+                    IsActive="{x:Bind ViewModel.IsBusy, Mode=OneWay}" />
+                <InfoBar
+                    x:Name="StatusInfoBar"
+                    Grid.Column="1"
+                    IsOpen="True"
+                    IsClosable="False"
+                    Title="Connection status"
+                    Message="{x:Bind ViewModel.Status, Mode=OneWay}" />
+            </Grid>
+        </StackPanel>
+    </ScrollViewer>
+</ContentDialog>
